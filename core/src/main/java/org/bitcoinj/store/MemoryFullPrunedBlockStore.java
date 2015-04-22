@@ -299,8 +299,17 @@ public class MemoryFullPrunedBlockStore implements FullPrunedBlockStore {
         StoredBlockAndWasUndoableFlag storedBlock = blockMap.get(hash);
         return storedBlock == null ? null : storedBlock.block;
     }
-    
+    // NIMBLECOIN
     @Override
+    public Map<Date, Integer> getStaleBlocks(int period, int maxPeriod) throws BlockStoreException {
+        throw new UnsupportedOperationException("Not implemented yet");
+    }
+    // NIMBLECOIN
+    @Override
+    public Map<Date, Integer> getBlocks(int period, int maxPeriod) throws BlockStoreException {
+        throw new UnsupportedOperationException("Not implemented yet");
+    }
+    
     @Nullable
     public synchronized StoredBlock getOnceUndoableStoredBlock(Sha256Hash hash) throws BlockStoreException {
         Preconditions.checkNotNull(blockMap, "MemoryFullPrunedBlockStore is closed");

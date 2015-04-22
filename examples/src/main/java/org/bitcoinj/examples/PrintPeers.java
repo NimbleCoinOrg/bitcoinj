@@ -79,9 +79,11 @@ public class PrintPeers {
 
         List<ListenableFuture<Void>> futures = Lists.newArrayList();
         NioClientManager clientManager = new NioClientManager();
+        // NIMBLECOIN
+        PeerGroup peerGroup = new PeerGroup(params, null, clientManager);
         for (final InetAddress addr : addrs) {
             InetSocketAddress address = new InetSocketAddress(addr, params.getPort());
-            final Peer peer = new Peer(params, new VersionMessage(params, 0), null, new PeerAddress(address));
+            final Peer peer = new Peer(peerGroup, params, new VersionMessage(params, 0), null, new PeerAddress(address));
             final SettableFuture<Void> future = SettableFuture.create();
             // Once the connection has completed version handshaking ...
             peer.addEventListener(new AbstractPeerEventListener() {

@@ -75,8 +75,13 @@ public class Block extends Message {
     /** A value for difficultyTarget (nBits) that allows half of all possible hash solutions. Used in unit testing. */
     public static final long EASIEST_DIFFICULTY_TARGET = 0x207fFFFFL;
 
+    private static final long FLAGS_ALL_ZERO = 0x0L;
+    private static final long FLAGS_EMPTY_BLOCK_TRUE = 0x1L;
+    private static final long FLAGS_EMPTY_BLOCK_FALSE = 0xFFFEL;
+    
     // Fields defined as part of the protocol format.
     private long version;
+    private long flags;
     private Sha256Hash prevBlockHash;
     private Sha256Hash merkleRoot;
     private long time;
@@ -102,10 +107,11 @@ public class Block extends Message {
     private transient int optimalEncodingMessageSize;
 
     /** Special case constructor, used for the genesis node, cloneAsHeader and unit tests. */
-    Block(NetworkParameters params) {
+    public Block(NetworkParameters params) {
         super(params);
         // Set up a few basic things. We are not complete after this though.
-        version = 1;
+        version = NetworkParameters.PROTOCOL_VERSION;
+        flags = 0;
         difficultyTarget = 0x1d07fff8L;
         time = System.currentTimeMillis() / 1000;
         prevBlockHash = Sha256Hash.ZERO_HASH;
@@ -150,6 +156,7 @@ public class Block extends Message {
                  long difficultyTarget, long nonce, List<Transaction> transactions) {
         super(params);
         this.version = version;
+        this.flags = FLAGS_ALL_ZERO;
         this.prevBlockHash = prevBlockHash;
         this.merkleRoot = merkleRoot;
         this.time = time;
@@ -185,7 +192,8 @@ public class Block extends Message {
             return;
 
         cursor = offset;
-        version = readUint32();
+        version = readUint16();
+        flags = readUint16();
         prevBlockHash = readHash();
         merkleRoot = readHash();
         time = readUint32();
@@ -385,7 +393,8 @@ public class Block extends Message {
         }
         // fall back to manual write
         maybeParseHeader();
-        Utils.uint32ToByteStreamLE(version, stream);
+        Utils.uint16ToByteStreamLE(version, stream);
+        Utils.uint16ToByteStreamLE(flags, stream);
         stream.write(Utils.reverseBytes(prevBlockHash.getBytes()));
         stream.write(Utils.reverseBytes(getMerkleRoot().getBytes()));
         Utils.uint32ToByteStreamLE(time, stream);
@@ -565,6 +574,7 @@ public class Block extends Message {
         block.prevBlockHash = prevBlockHash;
         block.merkleRoot = getMerkleRoot();
         block.version = version;
+        block.flags = flags;
         block.time = time;
         block.difficultyTarget = difficultyTarget;
         block.transactions = null;
@@ -580,7 +590,12 @@ public class Block extends Message {
     public String toString() {
         StringBuilder s = new StringBuilder("v");
         s.append(version);
+        s.append(" flags: ");
+        s.append(flags);
         s.append(" block: \n");
+        s.append("   hash: ");
+        s.append(getHash());
+        s.append("\n");
         s.append("   previous block: ");
         s.append(getPrevBlockHash());
         s.append("\n");
@@ -623,6 +638,10 @@ public class Block extends Message {
                     return;
                 // No, so increment the nonce and try again.
                 setNonce(getNonce() + 1);
+                if (getNonce() % 100000 == 0 ) {
+                	log.info("Solving block. Nonce: " + getNonce());
+                }
+                
             } catch (VerificationException e) {
                 throw new RuntimeException(e); // Cannot happen.
             }
@@ -643,7 +662,7 @@ public class Block extends Message {
     }
 
     /** Returns true if the hash of the block is OK (lower than difficulty target). */
-    private boolean checkProofOfWork(boolean throwException) throws VerificationException {
+    public boolean checkProofOfWork(boolean throwException) throws VerificationException {
         // This part is key - it is what proves the block was as difficult to make as it claims
         // to be. Note however that in the context of this function, the block can claim to be
         // as difficult as it wants to be .... if somebody was able to take control of our network
@@ -694,64 +713,11 @@ public class Block extends Message {
     }
 
     private Sha256Hash calculateMerkleRoot() {
-        List<byte[]> tree = buildMerkleTree();
-        return new Sha256Hash(tree.get(tree.size() - 1));
+        maybeParseTransactions();
+        return MerkleTreeUtils.calculateTransactionsMerkleRoot(transactions);
     }
 
-    private List<byte[]> buildMerkleTree() {
-        // The Merkle root is based on a tree of hashes calculated from the transactions:
-        //
-        //     root
-        //      / \
-        //   A      B
-        //  / \    / \
-        // t1 t2 t3 t4
-        //
-        // The tree is represented as a list: t1,t2,t3,t4,A,B,root where each
-        // entry is a hash.
-        //
-        // The hashing algorithm is double SHA-256. The leaves are a hash of the serialized contents of the transaction.
-        // The interior nodes are hashes of the concenation of the two child hashes.
-        //
-        // This structure allows the creation of proof that a transaction was included into a block without having to
-        // provide the full block contents. Instead, you can provide only a Merkle branch. For example to prove tx2 was
-        // in a block you can just provide tx2, the hash(tx1) and B. Now the other party has everything they need to
-        // derive the root, which can be checked against the block header. These proofs aren't used right now but
-        // will be helpful later when we want to download partial block contents.
-        //
-        // Note that if the number of transactions is not even the last tx is repeated to make it so (see
-        // tx3 above). A tree with 5 transactions would look like this:
-        //
-        //         root
-        //        /     \
-        //       1        5
-        //     /   \     / \
-        //    2     3    4  4
-        //  / \   / \   / \
-        // t1 t2 t3 t4 t5 t5
-        maybeParseTransactions();
-        ArrayList<byte[]> tree = new ArrayList<byte[]>();
-        // Start by adding all the hashes of the transactions as leaves of the tree.
-        for (Transaction t : transactions) {
-            tree.add(t.getHash().getBytes());
-        }
-        int levelOffset = 0; // Offset in the list where the currently processed level starts.
-        // Step through each level, stopping when we reach the root (levelSize == 1).
-        for (int levelSize = transactions.size(); levelSize > 1; levelSize = (levelSize + 1) / 2) {
-            // For each pair of nodes on that level:
-            for (int left = 0; left < levelSize; left += 2) {
-                // The right hand node can be the same as the left hand, in the case where we don't have enough
-                // transactions.
-                int right = Math.min(left + 1, levelSize - 1);
-                byte[] leftBytes = Utils.reverseBytes(tree.get(levelOffset + left));
-                byte[] rightBytes = Utils.reverseBytes(tree.get(levelOffset + right));
-                tree.add(Utils.reverseBytes(doubleDigestTwoBuffers(leftBytes, 0, 32, rightBytes, 0, 32)));
-            }
-            // Move to the next level.
-            levelOffset += levelSize;
-        }
-        return tree;
-    }
+
 
     private void checkTransactions() throws VerificationException {
         // The first transaction in a block must always be a coinbase transaction.
@@ -876,7 +842,25 @@ public class Block extends Message {
         maybeParseHeader();
         return version;
     }
+    
+    public long getFlags() {
+        maybeParseHeader();
+        return flags;
+    }
+    
+    public boolean getEmptyBlock() {
+        return (FLAGS_EMPTY_BLOCK_TRUE & flags) == FLAGS_EMPTY_BLOCK_TRUE ;
+    }
 
+    public void setEmptyBlock(boolean isEmpty) {
+        if (isEmpty) {
+            flags |= FLAGS_EMPTY_BLOCK_TRUE;
+        } else {
+            flags &= FLAGS_EMPTY_BLOCK_FALSE;            
+        }
+        
+    }
+ 
     /**
      * Returns the hash of the previous block in the chain, as defined by the block header.
      */
@@ -885,7 +869,7 @@ public class Block extends Message {
         return prevBlockHash;
     }
 
-    void setPrevBlockHash(Sha256Hash prevBlockHash) {
+    public void setPrevBlockHash(Sha256Hash prevBlockHash) {
         unCacheHeader();
         this.prevBlockHash = prevBlockHash;
         this.hash = null;
@@ -1066,7 +1050,7 @@ public class Block extends Message {
     }
 
     /**
-     * Create a block sending 50BTC as a coinbase transaction to the public key specified.
+     * Create a block sending 50NBC as a coinbase transaction to the public key specified.
      * This method is intended for test use only.
      */
     @VisibleForTesting

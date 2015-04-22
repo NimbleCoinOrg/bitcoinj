@@ -39,7 +39,12 @@ public class VersionMessage extends Message {
     /** A flag that denotes whether the peer supports the getutxos message or not. */
     public static final int NODE_GETUTXOS = 2;
 
-    /**
+ 
+   /** NIMBLECOIN
+     * A services flag that denotes whether the peer accept udp messages or not
+     */
+    public static final int ACCEPT_UDP = 3;
+   /**    
      * The version number of the protocol spoken.
      */
     public int clientVersion;
@@ -59,6 +64,11 @@ public class VersionMessage extends Message {
      * What the other side believes their own address is. Not used.
      */
     public PeerAddress theirAddr;
+
+    /** NIMBLECOIN
+     * Node random nonce, randomly generated every time a version packet is sent. This nonce is used to detect connections to self.
+     */
+    public long nonce;
     /**
      * User-Agent as defined in <a href="https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki">BIP 14</a>.
      * The official client sets it to something like "/Satoshi:0.9.1/".
@@ -77,7 +87,7 @@ public class VersionMessage extends Message {
     /** The version of this library release, as a string. */
     public static final String BITCOINJ_VERSION = "0.13-SNAPSHOT";
     /** The value that is prepended to the subVer field of this application. */
-    public static final String LIBRARY_SUBVER = "/bitcoinj:" + BITCOINJ_VERSION + "/";
+    public static final String LIBRARY_SUBVER = "/Nimblecoinj:" + BITCOINJ_VERSION + "/";
 
     public VersionMessage(NetworkParameters params, byte[] payload) throws ProtocolException {
         super(params, payload, 0);
@@ -88,9 +98,13 @@ public class VersionMessage extends Message {
     // back down the wire.
     
     public VersionMessage(NetworkParameters params, int newBestHeight) {
+        this(params, newBestHeight, true, false, params.getPort(), false);
+    }
+
+    public VersionMessage(NetworkParameters params, int newBestHeight, boolean relayTxesBeforeFilter, boolean hasACopyOfTheBlockChain, int serverPort, boolean acceptUdp) {
         super(params);
         clientVersion = NetworkParameters.PROTOCOL_VERSION;
-        localServices = 0;
+        localServices = (hasACopyOfTheBlockChain ? NODE_NETWORK : 0) | (acceptUdp ? ACCEPT_UDP : 0);
         time = System.currentTimeMillis() / 1000;
         // Note that the official client doesn't do anything with these, and finding out your own external IP address
         // is kind of tricky anyway, so we just put nonsense here for now.
@@ -98,11 +112,12 @@ public class VersionMessage extends Message {
             // We hard-code the IPv4 localhost address here rather than use InetAddress.getLocalHost() because some
             // mobile phones have broken localhost DNS entries, also, this is faster.
             final byte[] localhost = { 127, 0, 0, 1 };
-            myAddr = new PeerAddress(InetAddress.getByAddress(localhost), params.getPort(), 0);
+            myAddr = new PeerAddress(InetAddress.getByAddress(localhost), serverPort, 0);
             theirAddr = new PeerAddress(InetAddress.getByAddress(localhost), params.getPort(), 0);
         } catch (UnknownHostException e) {
             throw new RuntimeException(e);  // Cannot happen (illegal IP length).
         }
+        nonce = params.equals(NetboxParams.get()) ? NetboxParams.get().getSelfNode() : new Random().nextLong();
         subVer = LIBRARY_SUBVER;
         bestHeight = newBestHeight;
         relayTxesBeforeFilter = true;
@@ -131,10 +146,7 @@ public class VersionMessage extends Message {
         cursor += myAddr.getMessageSize();
         theirAddr = new PeerAddress(params, payload, cursor, 0);
         cursor += theirAddr.getMessageSize();
-        // uint64 localHostNonce  (random data)
-        // We don't care about the localhost nonce. It's used to detect connecting back to yourself in cases where
-        // there are NATs and proxies in the way. However we don't listen for inbound connections so it's irrelevant.
-        readUint64();
+        nonce = readUint64().longValue();
         try {
             // Initialize default values for flags which may not be sent by old nodes
             subVer = "";
@@ -173,11 +185,8 @@ public class VersionMessage extends Message {
         } catch (IOException e) {
             throw new RuntimeException(e);  // Can't happen.
         }
-        // Next up is the "local host nonce", this is to detect the case of connecting
-        // back to yourself. We don't care about this as we won't be accepting inbound 
-        // connections.
-        Utils.uint32ToByteStreamLE(0, buf);
-        Utils.uint32ToByteStreamLE(0, buf);
+        Utils.uint32ToByteStreamLE(nonce, buf);
+        Utils.uint32ToByteStreamLE(nonce >> 32, buf);
         // Now comes subVer.
         byte[] subVerBytes = subVer.getBytes("UTF-8");
         buf.write(new VarInt(subVerBytes.length).encode());
@@ -185,6 +194,10 @@ public class VersionMessage extends Message {
         // Size of known block chain.
         Utils.uint32ToByteStreamLE(bestHeight, buf);
         buf.write(relayTxesBeforeFilter ? 1 : 0);
+    }
+    
+    public long getNonce() {
+        return nonce;
     }
 
     /**
@@ -195,6 +208,13 @@ public class VersionMessage extends Message {
         return (localServices & NODE_NETWORK) == NODE_NETWORK;
     }
 
+    /**
+     * Returns true if the version message indicates the sender accept udp connections
+     */
+    public boolean acceptUdp() {
+        return (localServices & ACCEPT_UDP) == ACCEPT_UDP;
+    }
+    
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;
@@ -213,7 +233,9 @@ public class VersionMessage extends Message {
     @Override
     public int hashCode() {
         return (int) bestHeight ^ clientVersion ^ (int) localServices ^ (int) time ^ subVer.hashCode() ^ myAddr.hashCode()
-            ^ theirAddr.hashCode() * (relayTxesBeforeFilter ? 1 : 2);
+            ^ theirAddr.hashCode()
+            ^ (int) nonce
+            * (relayTxesBeforeFilter ? 1 : 2);
     }
 
     /**
@@ -241,6 +263,7 @@ public class VersionMessage extends Message {
         sb.append("time:           ").append(time).append("\n");
         sb.append("my addr:        ").append(myAddr).append("\n");
         sb.append("their addr:     ").append(theirAddr).append("\n");
+        sb.append("nonce:          ").append(nonce).append("\n");
         sb.append("sub version:    ").append(subVer).append("\n");
         sb.append("best height:    ").append(bestHeight).append("\n");
         sb.append("delay tx relay: ").append(!relayTxesBeforeFilter).append("\n");
@@ -248,12 +271,13 @@ public class VersionMessage extends Message {
     }
 
     public VersionMessage duplicate() {
-        VersionMessage v = new VersionMessage(params, (int) bestHeight);
+        VersionMessage v = new VersionMessage(params, (int) bestHeight, relayTxesBeforeFilter, hasBlockChain(), this.myAddr.getPort(), acceptUdp());
         v.clientVersion = clientVersion;
         v.localServices = localServices;
         v.time = time;
         v.myAddr = myAddr;
         v.theirAddr = theirAddr;
+        v.nonce = nonce;
         v.subVer = subVer;
         v.relayTxesBeforeFilter = relayTxesBeforeFilter;
         return v;

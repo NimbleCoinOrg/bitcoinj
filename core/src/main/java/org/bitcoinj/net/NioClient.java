@@ -70,6 +70,11 @@ public class NioClient implements MessageWriteTarget {
         public int receiveBytes(ByteBuffer buff) throws Exception {
             return upstreamParser.receiveBytes(buff);
         }
+        // NIMBLECOIN
+        @Override
+        public void receiveHighPriorityBytes(byte[] bytes, int offset, int length) {
+            upstreamParser.receiveHighPriorityBytes(bytes, offset, length);            
+        }
 
         @Override
         public synchronized void setWriteTarget(MessageWriteTarget writeTarget) {
@@ -106,7 +111,7 @@ public class NioClient implements MessageWriteTarget {
             @Override
             public void onSuccess(SocketAddress result) {
             }
-
+    
             @Override
             public void onFailure(Throwable t) {
                 log.error("Connect to {} failed: {}", serverAddress, Throwables.getRootCause(t));
@@ -122,5 +127,15 @@ public class NioClient implements MessageWriteTarget {
     @Override
     public synchronized void writeBytes(byte[] message) throws IOException {
         handler.writeTarget.writeBytes(message);
+    }
+    // NIMBLECOIN
+    @Override
+    public void setUDPPort(int udpPort) throws IOException {
+        handler.writeTarget.setUDPPort(udpPort);
+    }
+    // NIMBLECOIN
+    @Override
+    public synchronized void writeHighPriorityBytes(byte[] message) throws IOException {
+        handler.writeTarget.writeHighPriorityBytes(message);
     }
 }

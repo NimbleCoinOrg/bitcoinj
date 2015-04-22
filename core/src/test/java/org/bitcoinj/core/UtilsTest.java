@@ -61,4 +61,45 @@ public class UtilsTest {
         assertEquals("2014-11-16T10:54:33Z", Utils.dateTimeFormat(1416135273781L));
         assertEquals("2014-11-16T10:54:33Z", Utils.dateTimeFormat(new Date(1416135273781L)));
     }
+   // NIMBLECOIN
+   @Test
+    public void testMPI() throws Exception {
+    	byte[] mpi = {0, 0, 0, 29, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    	BigInteger value = Utils.decodeMPI(mpi, true);
+    	byte[] mpi2 = Utils.encodeMPI(value, true);
+        assertArrayEquals(mpi, mpi2);
+    	
+        value = BigInteger.valueOf(-1);
+    	mpi = Utils.encodeMPI(value, true);
+    	BigInteger value2 = Utils.decodeMPI(mpi, true);
+        assertEquals(value, value2);
+
+        value = BigInteger.valueOf(-128);
+    	mpi = Utils.encodeMPI(value, true);
+    	value2 = Utils.decodeMPI(mpi, true);
+        assertEquals(value, value2);
+
+    }    
+   // NIMBLECOIN
+    @Test
+    public void testCompactBits() throws Exception {
+    	long value = 0x1dffffffl;
+        assertEquals(value, Utils.encodeCompactBits(Utils.decodeCompactBits(value)));
+    	value = 0x1fffffffl;
+        assertEquals(value, Utils.encodeCompactBits(Utils.decodeCompactBits(value)));
+    	value = 0x8fffffffl;
+        assertEquals(value, Utils.encodeCompactBits(Utils.decodeCompactBits(value)));
+    }
+    // NIMBLECOIN
+    @Test
+    public void testIsPowerOf2() throws Exception {
+        assertEquals(true, Utils.isPowerOf2(1));
+        assertEquals(true, Utils.isPowerOf2(2));
+        assertEquals(true, Utils.isPowerOf2(4));
+        assertEquals(true, Utils.isPowerOf2(8));
+        assertEquals(true, Utils.isPowerOf2(16));
+        assertEquals(true, Utils.isPowerOf2(32));
+        assertEquals(false, Utils.isPowerOf2(5));
+        assertEquals(false, Utils.isPowerOf2(24));
+    }
 }

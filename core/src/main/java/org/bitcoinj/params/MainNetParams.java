@@ -35,19 +35,21 @@ public class MainNetParams extends NetworkParameters {
         addressHeader = 0;
         p2shHeader = 5;
         acceptableAddressCodes = new int[] { addressHeader, p2shHeader };
-        port = 8333;
+        port = 8335; // NIMBLECOIN PORT
         packetMagic = 0xf9beb4d9L;
         bip32HeaderPub = 0x0488B21E; //The 4 byte header that serializes in base58 to "xpub".
         bip32HeaderPriv = 0x0488ADE4; //The 4 byte header that serializes in base58 to "xprv"
-
-        genesisBlock.setDifficultyTarget(0x1d00ffffL);
-        genesisBlock.setTime(1231006505L);
-        genesisBlock.setNonce(2083236893);
+        // NIMBLECOIN GENESIS
+        genesisPubKey = new byte[]{2, -23, 45, 110, 36, 25, -85, -34, 43, 83, -42, 52, 7, -127, -18, -57, 52, -18, -20, -82, 125, -21, -33, 80, 116, 49, 29, -74, 12, 85, 55, -36, -50};
+        genesisBlock = createGenesis();
+        genesisBlock.setDifficultyTarget(0x1f00ffffL);
+        genesisBlock.setTime(1398701302L);
+        genesisBlock.setNonce(8371);
         id = ID_MAINNET;
         subsidyDecreaseBlockCount = 210000;
         spendableCoinbaseDepth = 100;
         String genesisHash = genesisBlock.getHashAsString();
-        checkState(genesisHash.equals("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"),
+        checkState(genesisHash.equals("0000e23f6b9170fc6dbd25e953dcbbc10c9c9c0748ff9623a089c7c8a0976b93"),
                 genesisHash);
 
         // This contains (at a minimum) the blocks which are not BIP30 compliant. BIP30 changed how duplicate

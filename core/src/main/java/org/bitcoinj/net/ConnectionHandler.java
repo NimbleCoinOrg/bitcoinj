@@ -162,6 +162,16 @@ class ConnectionHandler implements MessageWriteTarget {
         }
         lock.unlock();
     }
+    // NIMBLECOIN
+    @Override
+    public void setUDPPort(int udpPort) throws IOException {
+        throw new UnsupportedOperationException();        
+    }
+    // NIMBLECOIN
+    @Override
+    public void writeHighPriorityBytes(byte[] message) throws IOException {
+        throw new UnsupportedOperationException();        
+    }
 
     @Override
     // May NOT be called with lock held

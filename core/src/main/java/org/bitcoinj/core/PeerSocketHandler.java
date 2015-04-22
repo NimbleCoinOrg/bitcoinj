@@ -73,6 +73,9 @@ public abstract class PeerSocketHandler extends AbstractTimeoutHandler implement
      * the peer will have received it. Throws NotYetConnectedException if we are not yet connected to the remote peer.
      * TODO: Maybe use something other than the unchecked NotYetConnectedException here
      */
+    public void sendLowPriorityMessage(Message message) throws NotYetConnectedException {
+      sendMessage(message);
+    }
     public void sendMessage(Message message) throws NotYetConnectedException {
         lock.lock();
         try {
@@ -90,7 +93,28 @@ public abstract class PeerSocketHandler extends AbstractTimeoutHandler implement
             exceptionCaught(e);
         }
     }
-
+    // NIMBLECOIN BEGIN
+    public void sendHighPriorityMessage(Message message) throws NotYetConnectedException {
+        lock.lock();
+        try {
+            if (writeTarget == null)
+                throw new NotYetConnectedException();
+        } finally {
+            lock.unlock();
+        }
+        // TODO: Some round-tripping could be avoided here
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try {
+            Utils.int64ToByteStreamLE(getSelfNodeId(), out);
+            serializer.serialize(message, out);
+            writeTarget.writeHighPriorityBytes(out.toByteArray());
+            log.info("{}: UDP Sent {}", this, message.getClass());
+        } catch (IOException e) {
+            exceptionCaught(e);
+        }
+    }
+    
+    // NIMBLECOIN END
     /**
      * Closes the connection to the peer if one exists, or immediately closes the connection as soon as it opens
      */
@@ -185,6 +209,24 @@ public abstract class PeerSocketHandler extends AbstractTimeoutHandler implement
             return -1; // Returning -1 also throws an IllegalStateException upstream and kills the connection
         }
     }
+    // NIMBLECOIN BEGIN
+    @Override
+    public void receiveHighPriorityBytes(byte[] bytes, int offset, int length) {
+        try {
+            long nodeId = Utils.readInt64(bytes, offset);
+            offset = offset + 6;
+            length = length - 6;
+            ByteBuffer buff = ByteBuffer.allocateDirect(65536);
+            buff.put(bytes, offset, length);
+            buff.flip();            
+            Message message = serializer.deserialize(buff);
+            processHighPriorityMessage(nodeId, message);
+        } catch (Exception e) {
+            exceptionCaught(e);
+        }
+        
+    }
+    // NIMBLECOIN END
 
     /**
      * Sets the {@link MessageWriteTarget} used to write messages to the peer. This should almost never be called, it is

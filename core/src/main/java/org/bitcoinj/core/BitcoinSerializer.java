@@ -73,6 +73,10 @@ public class BitcoinSerializer {
         names.put(RejectMessage.class, "reject");
         names.put(GetUTXOsMessage.class, "getutxos");
         names.put(UTXOsMessage.class, "utxos");
+        names.put(PushHeader.class, "pushheader");
+        names.put(PushHeaderAck.class, "pheaderack");
+        names.put(PushTransactionList.class, "pushtxlist");
+ 
     }
 
     /**
@@ -240,6 +244,13 @@ public class BitcoinSerializer {
             return new UTXOsMessage(params, payloadBytes);
         } else if (command.equals("getutxos")) {
             return new GetUTXOsMessage(params, payloadBytes);
+        } else if (command.equals("pushheader")) {
+            return new PushHeader(params, payloadBytes);
+        } else if (command.equals("pheaderack")) {
+            return new PushHeaderAck(params, payloadBytes);
+        } else if (command.equals("pushtxlist")) {
+            return new PushTransactionList(params, payloadBytes);
+  
         } else {
             log.warn("No support for deserializing message with name {}", command);
             return new UnknownMessage(params, command, payloadBytes);

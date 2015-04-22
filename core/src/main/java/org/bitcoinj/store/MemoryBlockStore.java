@@ -61,8 +61,17 @@ public class MemoryBlockStore implements BlockStore {
         if (blockMap == null) throw new BlockStoreException("MemoryBlockStore is closed");
         return blockMap.get(hash);
     }
-
+    // NIMBLECOIN
     @Override
+    public Map<Date, Integer> getStaleBlocks(int period, int maxPeriod) throws BlockStoreException {
+        throw new UnsupportedOperationException("Not implemented yet");
+    }
+    // NIMBLECOIN  
+    @Override
+    public Map<Date, Integer> getBlocks(int period, int maxPeriod) throws BlockStoreException {
+        throw new UnsupportedOperationException("Not implemented yet");
+    }
+    
     public StoredBlock getChainHead() throws BlockStoreException {
         if (blockMap == null) throw new BlockStoreException("MemoryBlockStore is closed");
         return chainHead;

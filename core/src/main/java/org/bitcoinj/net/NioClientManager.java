@@ -183,7 +183,12 @@ public class NioClientManager extends AbstractExecutionThreadService implements 
                 handler.closeConnection(); // Removes handler from connectedHandlers before returning
         }
     }
-
+    // NIMBLECOIN
+	@Override
+	public void acceptConnections(StreamParserFactory parserFactory) {
+		throw new UnsupportedOperationException("Not implemented yet");
+		
+	}
     @Override
     protected Executor executor() {
         return new Executor() {

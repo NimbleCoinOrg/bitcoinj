@@ -132,4 +132,9 @@ public abstract class ListMessage extends Message {
     public int hashCode() {
         return items.hashCode();
     }
+
+    @Override
+    public String toString() {
+        return "ListMessage [arrayLen=" + arrayLen + ", items=" + items + "]";
+    }
 }

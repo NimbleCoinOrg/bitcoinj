@@ -220,7 +220,17 @@ public class SPVBlockStore implements BlockStore {
             throw new RuntimeException(e);  // Cannot happen.
         } finally { lock.unlock(); }
     }
-
+    // NIMBLECOIN
+    @Override
+    public Map<Date, Integer> getStaleBlocks(int period, int maxPeriod) throws BlockStoreException {
+        throw new UnsupportedOperationException("Not implemented yet");
+    }
+    // NIMBLECOIN
+    @Override
+    public Map<Date, Integer> getBlocks(int period, int maxPeriod) throws BlockStoreException {
+        throw new UnsupportedOperationException("Not implemented yet");
+    }
+    
     protected StoredBlock lastChainHead = null;
 
     @Override

@@ -49,6 +49,11 @@ public interface StreamParser {
      * @return The amount of bytes consumed which should not be provided again
      */
     int receiveBytes(ByteBuffer buff) throws Exception;
+    /** NIMBLECOIN
+     * Called when new bytes arrived via UDP. The bytes are not necessarily for this StreamParser.
+     * It is StreamParser's responsibility to check whether the bytes are for it or not
+     */
+    void receiveHighPriorityBytes(byte[] bytes, int offset, int length);
 
     /**
      * Called when this parser is attached to an upstream write target (ie a low-level connection handler). This

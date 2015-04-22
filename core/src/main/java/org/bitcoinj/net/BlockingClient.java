@@ -42,8 +42,12 @@ public class BlockingClient implements MessageWriteTarget {
     private static final int BUFFER_SIZE_LOWER_BOUND = 4096;
     private static final int BUFFER_SIZE_UPPER_BOUND = 65536;
 
-    private final ByteBuffer dbuf;
+    private StreamParser parser; 
+    private ByteBuffer dbuf;
     private Socket socket;
+    private DatagramSocket datagramSocket;
+    private InetAddress udpAddress; 
+    private int udpPort; 
     private volatile boolean vCloseRequested = false;
     private SettableFuture<SocketAddress> connectFuture;
 
@@ -59,13 +63,74 @@ public class BlockingClient implements MessageWriteTarget {
      *                      how this client connects to the internet. If not sure, use SocketFactory.getDefault()
      * @param clientSet A set which this object will add itself to after initialization, and then remove itself from
      */
-    public BlockingClient(final SocketAddress serverAddress, final StreamParser parser,
+   public BlockingClient(final SocketAddress serverAddress, final StreamParser parser,
+                          final int connectTimeoutMillis, final SocketFactory socketFactory, @Nullable final Set<BlockingClient> clientSet) throws IOException {
+      allInit(serverAddress, new DatagramSocket(), parser,
+                          connectTimeoutMillis, socketFactory, clientSet);
+  
+    }
+
+    public allInit(final SocketAddress serverAddress, 
+                          DatagramSocket _datagramSocket,
+						  final StreamParser parser,
                           final int connectTimeoutMillis, final SocketFactory socketFactory, @Nullable final Set<BlockingClient> clientSet) throws IOException {
         connectFuture = SettableFuture.create();
+        init(parser);
+        this.parser = parser; 
+        socket = socketFactory.createSocket();
+        datagramSocket = _datagramSocket;
+        InetSocketAddress inetSocketAddress = (InetSocketAddress) serverAddress;
+        udpAddress = inetSocketAddress.getAddress();
+        Thread t = new SocketThread(clientSet, false, serverAddress, connectTimeoutMillis, parser);
+        t.start();  
+    }
+
+     public BlockingClient(final SocketAddress serverAddress,  DatagramSocket _datagramSocket,final StreamParser parser,
+                          final int connectTimeoutMillis, final SocketFactory socketFactory, @Nullable final Set<BlockingClient> clientSet) throws IOException {
+        
+      allInit(serverAddress, _datagramSocket, parser,
+                          connectTimeoutMillis, socketFactory, clientSet);
+    }
+
+    public BlockingClient(Socket _socket, DatagramSocket _datagramSocket, StreamParserFactory parserFactory, final Set<BlockingClient> clientSet) {
+        StreamParser parser = parserFactory.getNewParser(_socket.getInetAddress(), _socket.getPort());
+        init(parser);
+        this.parser = parser; 
+        socket = _socket;
+        datagramSocket = _datagramSocket;
+        udpAddress = _socket.getInetAddress();        
+        Thread t = new SocketThread(clientSet, true, socket.getRemoteSocketAddress(), 0, parser);
+        t.start();
+    }
+
+    private void init(final StreamParser parser) {
         // Try to fit at least one message in the network buffer, but place an upper and lower limit on its size to make
         // sure it doesnt get too large or have to call read too often.
         dbuf = ByteBuffer.allocateDirect(Math.min(Math.max(parser.getMaxMessageSize(), BUFFER_SIZE_LOWER_BOUND), BUFFER_SIZE_UPPER_BOUND));
         parser.setWriteTarget(this);
+    }
+    // NIMBLECOIN MODIFIED
+    private class SocketThread extends Thread {
+        public SocketThread(Set<BlockingClient> clientSet, boolean connected,
+                SocketAddress serverAddress, int connectTimeoutMillis,
+                StreamParser parser) {
+            super();
+            this.clientSet = clientSet;
+            this.connected = connected;
+            this.serverAddress = serverAddress;
+            this.connectTimeoutMillis = connectTimeoutMillis;
+            this.parser = parser;
+            this.setName("BlockingClient network thread for " + (connected ? "incoming" : "outgoing") + " " + serverAddress);
+            this.setDaemon(true);
+            
+        }
+        Set<BlockingClient> clientSet;
+        boolean connected;
+        SocketAddress serverAddress;
+        int connectTimeoutMillis;
+        StreamParser parser;
+        @Override
+        public void run() {
         socket = socketFactory.createSocket();
         final Context context = Context.get();
         Thread t = new Thread() {
@@ -75,7 +140,9 @@ public class BlockingClient implements MessageWriteTarget {
                 if (clientSet != null)
                     clientSet.add(BlockingClient.this);
                 try {
+                if (!connected) {
                     socket.connect(serverAddress, connectTimeoutMillis);
+                }
                     parser.connectionOpened();
                     connectFuture.set(serverAddress);
                     InputStream stream = socket.getInputStream();
@@ -147,7 +214,27 @@ public class BlockingClient implements MessageWriteTarget {
             throw e;
         }
     }
+    // NIMBLECOIN
+    @Override
+    public void setUDPPort(int udpPort) throws IOException {
+        this.udpPort = udpPort;        
+    }
+    @Override
+    public synchronized void writeHighPriorityBytes(byte[] message) throws IOException {
+        try {            
+            DatagramPacket packet = new DatagramPacket(message, message.length, udpAddress, udpPort);
+            datagramSocket.send(packet);
+        } catch (IOException e) {
+            log.error("Error writing message to connection, closing connection", e);
+            closeConnection();
+            throw e;
+        }
+    }
 
+    public void receiveBytesUDP(byte[] bytes, int offset, int length) {
+        parser.receiveHighPriorityBytes(bytes, offset, length);
+    }
+       
     /** Returns a future that completes once connection has occurred at the socket level or with an exception if failed to connect. */
     public ListenableFuture<SocketAddress> getConnectFuture() {
         return connectFuture;

@@ -1079,6 +1079,12 @@ public class Wallet extends BaseTaggableObject implements Serializable, BlockCha
         saveNow();
     }
 
+    // NIMBLECOIN
+    @Override
+    public void notifyNewBestHeader(Block header) throws VerificationException {
+        // do-nothing
+    }
+
     /**
      * Decrypt the wallet with the wallets keyCrypter and AES key.
      *

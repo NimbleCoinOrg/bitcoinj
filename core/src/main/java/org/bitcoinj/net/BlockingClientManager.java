@@ -21,6 +21,9 @@ import com.google.common.util.concurrent.ListenableFuture;
 
 import javax.net.SocketFactory;
 import java.io.IOException;
+import java.net.DatagramSocket;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.SocketAddress;
 import java.util.Collections;
 import java.util.HashSet;
@@ -39,11 +42,24 @@ import static com.google.common.base.Preconditions.checkNotNull;
 public class BlockingClientManager extends AbstractIdleService implements ClientConnectionManager {
     private final SocketFactory socketFactory;
     private final Set<BlockingClient> clients = Collections.synchronizedSet(new HashSet<BlockingClient>());
-
     private int connectTimeoutMillis = 1000;
+    private int serverPort;
+    private ServerSocket serverSocket;
+    private DatagramSocket datagramSocket;
+    private boolean acceptUdp = false;
+    private UDPSocketThread udpSocketThread;
 
-    public BlockingClientManager() {
+    private volatile boolean vServerCloseRequested = false;
+
+
+    public BlockingClientManager(NetworkParameters params) {
+        this(params.getPort(), false);
+    }
+
+    public BlockingClientManager(int serverPort, boolean acceptUdp) {
+        this.serverPort = serverPort;
         socketFactory = SocketFactory.getDefault();
+        this.acceptUdp = acceptUdp;
     }
 
     /**
@@ -59,7 +75,7 @@ public class BlockingClientManager extends AbstractIdleService implements Client
         try {
             if (!isRunning())
                 throw new IllegalStateException();
-            return new BlockingClient(serverAddress, parser, connectTimeoutMillis, socketFactory, clients).getConnectFuture();
+            return new BlockingClient(serverAddress, datagramSocket,parser, connectTimeoutMillis, socketFactory, clients).getConnectFuture();
         } catch (IOException e) {
             throw new RuntimeException(e); // This should only happen if we are, eg, out of system resources
         }
@@ -71,14 +87,32 @@ public class BlockingClientManager extends AbstractIdleService implements Client
     }
 
     @Override
-    protected void startUp() throws Exception { }
+    protected void startUp() throws Exception {
+        // NIMBLECOIN
+        if (acceptUdp) {
+            datagramSocket = new DatagramSocket(serverPort);
+            udpSocketThread = new UDPSocketThread(datagramSocket, clients);
+            udpSocketThread.start();            
+        }
+    }
 
     @Override
     protected void shutDown() throws Exception {
+        // NIMBLECOIN
+        if (acceptUdp) {
+            udpSocketThread.doStop();            
+        }
         synchronized (clients) {
             for (BlockingClient client : clients)
                 client.closeConnection();
         }
+        // NIMBLECOIN BEGIN
+        datagramSocket.close();
+        if (serverSocket!=null) {
+            vServerCloseRequested = true;
+            serverSocket.close();
+        }
+        // NIMBLECOIN END
     }
 
     @Override
@@ -95,5 +129,43 @@ public class BlockingClientManager extends AbstractIdleService implements Client
             while (n-- > 0 && it.hasNext())
                 it.next().closeConnection();
         }
+    }
+    // NIMBLECOIN
+    @Override
+    public void acceptConnections(final StreamParserFactory parserFactory) {        
+        if (!isRunning())
+            throw new IllegalStateException();
+        try {
+            serverSocket = new ServerSocket(serverPort);
+            Thread t = new Thread() {
+                @Override
+                public void run() {
+                    try {
+                        log.info("Starting to accept connections on port " + serverPort);
+                        while (true) {                            
+                            Socket socket = serverSocket.accept();
+                            log.info("Accepted connection " + socket);
+                            new BlockingClient(socket, datagramSocket, parserFactory, clients);                            
+                        }
+                    } catch (Exception e) {
+                        if (!vServerCloseRequested)
+                            log.error("Error trying to accept new connection from server socket: " + serverSocket, e);
+                    } finally {
+                        try {
+                            serverSocket.close();
+                        } catch (IOException e1) {
+                            // At this point there isn't much we can do, and we can probably assume the channel is closed
+                        }
+                    }
+                }
+            };
+            t.setName("BlockingClientManager server socket thread");
+            t.setDaemon(true);
+            t.start();            
+        } catch (IOException e) {
+            throw new RuntimeException(e); // This should only happen if we are, eg, out of system resources
+        }
+
+        
     }
 }

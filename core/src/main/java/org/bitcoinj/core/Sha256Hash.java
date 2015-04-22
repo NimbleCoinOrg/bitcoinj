@@ -37,6 +37,7 @@ import static com.google.common.base.Preconditions.checkArgument;
  */
 public class Sha256Hash implements Serializable, Comparable<Sha256Hash> {
     private final byte[] bytes;
+    public static final int HASH_SIZE_IN_BYTES = 32;
     public static final Sha256Hash ZERO_HASH = new Sha256Hash(new byte[32]);
 
     /**

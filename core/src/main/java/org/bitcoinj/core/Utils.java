@@ -92,6 +92,11 @@ public class Utils {
         out[offset + 3] = (byte) (0xFF & (val >> 0));
     }
 
+    public static void uint16ToByteArrayLE(long val, byte[] out, int offset) {
+        out[offset + 0] = (byte) (0xFF & (val >> 0));
+        out[offset + 1] = (byte) (0xFF & (val >> 8));
+    }
+    
     public static void uint32ToByteArrayLE(long val, byte[] out, int offset) {
         out[offset + 0] = (byte) (0xFF & (val >> 0));
         out[offset + 1] = (byte) (0xFF & (val >> 8));
@@ -110,6 +115,11 @@ public class Utils {
         out[offset + 7] = (byte) (0xFF & (val >> 56));
     }
 
+    public static void uint16ToByteStreamLE(long val, OutputStream stream) throws IOException {
+        stream.write((int) (0xFF & (val >> 0)));
+        stream.write((int) (0xFF & (val >> 8)));
+    }
+    
     public static void uint32ToByteStreamLE(long val, OutputStream stream) throws IOException {
         stream.write((int) (0xFF & (val >> 0)));
         stream.write((int) (0xFF & (val >> 8)));
@@ -235,6 +245,11 @@ public class Utils {
         return rev;
 }
 
+    public static long readUint16(byte[] bytes, int offset) {
+        return ((bytes[offset++] & 0xFFL) << 0) |
+                ((bytes[offset] & 0xFFL) << 8);
+    }
+    
     public static long readUint32(byte[] bytes, int offset) {
         return ((bytes[offset++] & 0xFFL) << 0) |
                 ((bytes[offset++] & 0xFFL) << 8) |
@@ -622,6 +637,10 @@ public class Utils {
         }
         return maxItem;
     }
+
+    // NIMBLECOIN
+    public static boolean isPowerOf2(long positiveValue) {
+        return (positiveValue & (positiveValue - 1)) == 0;
 
     /**
      * Reads and joins together with LF char (\n) all the lines from given file. It's assumed that file is in UTF-8.

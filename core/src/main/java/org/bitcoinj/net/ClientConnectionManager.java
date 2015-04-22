@@ -40,4 +40,9 @@ public interface ClientConnectionManager extends Service {
 
     /** Closes n peer connections */
     void closeConnections(int n);
+    
+    /** NIMBLECOIN
+     * Start a server socket and accept incoming connections 
+     */
+    void acceptConnections(StreamParserFactory parserFactory);
 }

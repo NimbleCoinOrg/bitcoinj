@@ -98,6 +98,7 @@ public class WalletTool {
     private static Wallet wallet;
     private static File chainFileName;
     private static ValidationMode mode;
+    private static CompetitivePolicy competitivePolicy;
     private static String password;
     private static org.bitcoin.protocols.payments.Protos.PaymentRequest paymentRequest;
     private static OptionSpec<Integer> lookaheadSize;
@@ -174,6 +175,8 @@ public class WalletTool {
         DECRYPT,
         MARRY,
         ROTATE,
+        NONE,
+        DUMP_STALES
     }
 
     public enum WaitForEnum {
@@ -188,6 +191,7 @@ public class WalletTool {
         PROD, // alias for MAIN
         TEST,
         REGTEST
+        NETBOX
     }
 
     public enum ValidationMode {
@@ -195,6 +199,12 @@ public class WalletTool {
         SPV
     }
 
+    
+    public enum CompetitivePolicy {
+        LOWER_HASH,
+        DOUBLE_THE_BET
+    }
+    
     public static void main(String[] args) throws Exception {
         OptionParser parser = new OptionParser();
         parser.accepts("help");
@@ -231,6 +241,20 @@ public class WalletTool {
         parser.accepts("no-pki");
         parser.accepts("tor");
         parser.accepts("dump-privkeys");
+        parser.accepts("server");
+        parser.accepts("server-port").withRequiredArg();
+        parser.accepts("miner");
+        parser.accepts("miner-emulate").withRequiredArg();
+        parser.accepts("txgen-rate").withRequiredArg();
+        parser.accepts("stales-period").withRequiredArg();
+        parser.accepts("stales-max").withRequiredArg();
+        OptionSpec<CompetitivePolicy> competitivePolicyFlag = parser.accepts("competitive-policy")
+                .withRequiredArg()
+                .ofType(CompetitivePolicy.class)
+                .defaultsTo(CompetitivePolicy.LOWER_HASH);
+        parser.accepts("netbox-nodes").withRequiredArg();
+        parser.accepts("netbox-peers").withRequiredArg();
+        parser.accepts("accept-udp");
         options = parser.parse(args);
 
         final String HELP_TEXT = Resources.toString(WalletTool.class.getResource("wallet-tool-help.txt"), Charsets.UTF_8);
@@ -272,6 +296,10 @@ public class WalletTool {
             case REGTEST:
                 params = RegTestParams.get();
                 chainFileName = new File("regtest.chain");
+                break;
+            case NETBOX:
+                params = NetboxParams.get();
+                chainFileName  = new File("netbox.chain");
                 break;
             default:
                 throw new RuntimeException("Unreachable.");
@@ -322,6 +350,7 @@ public class WalletTool {
                 loader.setRequireMandatoryExtensions(false);
             walletInputStream = new BufferedInputStream(new FileInputStream(walletFile));
             wallet = loader.readWallet(walletInputStream);
+
             if (!wallet.getParams().equals(params)) {
                 System.err.println("Wallet does not match requested network parameters: " +
                         wallet.getParams().getId() + " vs " + params.getId());
@@ -339,6 +368,8 @@ public class WalletTool {
 
         // What should we do?
         switch (action) {
+            case NONE: break;
+            case DUMP_STALES: dumpStales(); break;
             case DUMP: dumpWallet(); break;
             case ADD_KEY: addKey(); break;
             case ADD_ADDR: addAddr(); break;
@@ -380,6 +411,14 @@ public class WalletTool {
         }
         
         saveWallet(walletFile);
+
+        if (options.has("miner")) {
+            mine();
+        }
+        if (options.has("txgen-rate")) {
+            startTransactionGenerator();
+        }
+
 
         if (options.has(waitForFlag)) {
             WaitForEnum value;
@@ -493,7 +532,45 @@ public class WalletTool {
             System.err.println("Password incorrect.");
         }
     }
+   // NIMBLECOIN
+   private static void mine() {
+        try {
+            checkArgument(mode.equals(ValidationMode.FULL), "Miner should be started in full mode");
+            setup();
+            if (!peers.isRunning()) {
+                peers.startAsync();
+                peers.awaitRunning();                
+            }
+            Miner miner = new Miner(params, peers, wallet, (FullPrunedBlockStore) store, chain);
+            if (options.has("miner-emulate")) {
+                int numberOfMinersInParallelToEmulate = Integer.valueOf((String) options.valueOf("miner-emulate"));            
+                miner.setNumberOfMinersInParallelToEmulate(numberOfMinersInParallelToEmulate);                
+            }
+            miner.startAsync();
+            miner.awaitRunning();
+        } catch (BlockStoreException e) {
+            System.err.println("Error reading block chain file " + chainBaseFile + ": " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
 
+    private static void startTransactionGenerator() {
+        try {
+            int rate = Integer.valueOf((String) options.valueOf("txgen-rate"));            
+            setup();
+            if (!peers.isRunning()) {
+                peers.startAsync();
+                peers.awaitRunning();                
+            }
+            TransactionGenerator txGenerator = new TransactionGenerator(params, peers, wallet, rate);
+            txGenerator.startAsync();
+            txGenerator.awaitRunning();
+        } catch (BlockStoreException e) {
+            System.err.println("Error reading block chain file " + chainBaseFile + ": " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+ 
     private static void addAddr() {
         String addr = (String) options.valueOf("addr");
         if (addr == null) {
@@ -825,9 +902,40 @@ public class WalletTool {
             store = s;
             chain = new FullPrunedBlockChain(params, wallet, s);
         }
+        // NIMBLECOIN BEGIN
+        if (competitivePolicy == CompetitivePolicy.LOWER_HASH) {
+            chain.setUseLowerHashPolicy(true);
+        } else if (competitivePolicy == CompetitivePolicy.DOUBLE_THE_BET) {
+            chain.setUseLowerHashPolicy(false);            
+        }
+        
+        if (params == NetboxParams.get()) {
+            NetboxParams netboxParams = NetboxParams.get();
+            int netboxNodes = Integer.valueOf((String) options.valueOf("netbox-nodes"));            
+            int netboxPeers = Integer.valueOf((String) options.valueOf("netbox-peers"));            
+            int serverPort = Integer.valueOf((String) options.valueOf("server-port"));
+            netboxParams.initialize(netboxNodes, netboxPeers, serverPort);
+        }
+        // NIMBLECOIN END
+
         // This will ensure the wallet is saved when it changes.
         wallet.autosaveToFile(walletFile, 5, TimeUnit.SECONDS, null);
-        if (options.has("tor")) {
+        // NIMBLECOIN BEGIN
+        if (competitivePolicy == CompetitivePolicy.LOWER_HASH) {
+            chain.setUseLowerHashPolicy(true);
+        } else if (competitivePolicy == CompetitivePolicy.DOUBLE_THE_BET) {
+            chain.setUseLowerHashPolicy(false);            
+        }
+        
+        if (params == NetboxParams.get()) {
+            NetboxParams netboxParams = NetboxParams.get();
+            int netboxNodes = Integer.valueOf((String) options.valueOf("netbox-nodes"));            
+            int netboxPeers = Integer.valueOf((String) options.valueOf("netbox-peers"));            
+            int serverPort = Integer.valueOf((String) options.valueOf("server-port"));
+            netboxParams.initialize(netboxNodes, netboxPeers, serverPort);
+        } 
+       // NIMBLECOIN END
+       if (options.has("tor")) {
             try {
                 peers = PeerGroup.newWithTor(params, chain, new TorClient());
             } catch (TimeoutException e) {
@@ -846,13 +954,31 @@ public class WalletTool {
             String[] peerAddrs = peersFlag.split(",");
             for (String peer : peerAddrs) {
                 try {
-                    peers.addAddress(new PeerAddress(InetAddress.getByName(peer), params.getPort()));
-                } catch (UnknownHostException e) {
+                    // NIMBLECOIN BEGIN
+                    String[] peerHostAndPort = peersFlag.split(":");
+                    String host = peerHostAndPort[0];
+                    int port = peerHostAndPort.length>1 ? Integer.valueOf(peerHostAndPort[0]) : params.getPort();
+                    peers.addAddress(new PeerAddress(InetAddress.getByName(host), port));
+                    // NIMBLECOIN END
+               } catch (UnknownHostException e) {
                     System.err.println("Could not understand peer domain name/IP address: " + peer + ": " + e.getMessage());
                     System.exit(1);
                 }
             }
-        } else if (!options.has("tor")) {
+
+        } else 
+        // NIMBLECOIN BEGIN
+        if (params == RegTestParams.get()) {
+                if (!options.has("server")) {
+                    log.info("Assuming regtest node on localhost");
+                    peers.addAddress(PeerAddress.localhost(params));                    
+                }                                    
+             } else if (params == NetboxParams.get()) {
+                int netboxPeers = Integer.valueOf((String) options.valueOf("netbox-peers"));            
+                peers.addPeerDiscovery(new NetboxDiscovery());
+                peers.setMaxConnections(netboxPeers);
+        // NIMBLECOIN END
+         } else if (!options.has("tor")) {
             peers.addPeerDiscovery(new DnsDiscovery(params));
         }
     }
@@ -1074,6 +1200,29 @@ public class WalletTool {
         }
         wallet.removeKey(key);
     }
+    // NIMBLECOIN BEGIN
+    private static void dumpStales() throws BlockStoreException {
+        setup();
+        int period = 60;
+        if (options.has("stales-period")) {
+            period = Integer.valueOf((String) options.valueOf("stales-period"));
+        }
+        int maxPeriod = 3600;
+        if (options.has("stales-max")) {
+            maxPeriod = Integer.valueOf((String) options.valueOf("stales-max"));
+        }        
+        Map<Date,Integer> map = store.getBlocks(period, maxPeriod);
+        System.out.println("Blocks");
+        for (Date periodBegin : map.keySet()) {
+            System.out.println(periodBegin + " : " + map.get(periodBegin));            
+        }
+        map = store.getStaleBlocks(period, maxPeriod);
+        System.out.println("Stale Blocks");
+        for (Date periodBegin : map.keySet()) {
+            System.out.println(periodBegin + " : " + map.get(periodBegin));            
+        }
+    }
+    // NIMBLECOIN END
 
     private static void currentReceiveAddr() {
         ECKey key = wallet.currentReceiveKey();

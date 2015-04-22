@@ -128,6 +128,9 @@ public abstract class AbstractBlockChain {
     // were downloading the block chain.
     private final LinkedHashMap<Sha256Hash, OrphanBlock> orphanBlocks = new LinkedHashMap<Sha256Hash, OrphanBlock>();
 
+    private final Map<Sha256Hash, Block> headersWaitingForItsTransactions = new HashMap<Sha256Hash, Block>();
+
+    
     /** False positive estimation uses a double exponential moving average. */
     public static final double FP_ESTIMATOR_ALPHA = 0.0001;
     /** False positive estimation uses a double exponential moving average. */
@@ -136,6 +139,10 @@ public abstract class AbstractBlockChain {
     private double falsePositiveRate;
     private double falsePositiveTrend;
     private double previousFalsePositiveRate;
+
+    private Wallet wallet;
+
+    private boolean useLowerHashPolicy = true;
 
     /** See {@link #AbstractBlockChain(Context, List, BlockStore)} */
     public AbstractBlockChain(NetworkParameters params, List<BlockChainListener> listeners,
@@ -163,6 +170,7 @@ public abstract class AbstractBlockChain {
      * wallets is not well tested!
      */
     public void addWallet(Wallet wallet) {
+        this.wallet = wallet;
         addListener(wallet, Threading.SAME_THREAD);
         int walletHeight = wallet.getLastBlockSeenHeight();
         int chainHeight = getBestChainHeight();
@@ -186,6 +194,9 @@ public abstract class AbstractBlockChain {
 
     /** Removes a wallet from the chain. */
     public void removeWallet(Wallet wallet) {
+        if (this.wallet.equals(wallet)) {
+            this.wallet = null;            
+        }
         removeListener(wallet);
     }
 
@@ -349,6 +360,74 @@ public abstract class AbstractBlockChain {
      */
     protected abstract TransactionOutputChanges connectTransactions(StoredBlock newBlock) throws VerificationException, BlockStoreException, PrunedException;    
     
+
+    /**
+     * Tries to add a header to the headersWaitingForItsTransactions.
+     * If it is already in the chain, in headersWaitingForItsTransactions or a known orphan does nothing and returns false
+     * If the header was succesfully added to headersWaitingForItsTransactions returns true
+     * @param block
+     */
+    public boolean addHeaderWaitingForItsTransactions(final Block block){
+        lock.lock();
+        try {
+            
+            if (block.equals(getChainHead().getHeader())) {
+                return false;                    
+            }
+
+            if (orphanBlocks.containsKey(block.getHash())) {
+                return false;
+            }
+
+            if (headersWaitingForItsTransactions.containsKey(block.getHash())) {
+                return false;
+            }
+
+            if (blockStore.get(block.getHash()) != null) {
+                return false;                    
+            }
+
+            try {
+                block.verifyHeader();
+            } catch (VerificationException e) {
+                log.error("Failed to verify block: ", e);
+                log.error(block.getHashAsString());
+                throw e;
+            }
+            
+            headersWaitingForItsTransactions.put(block.getHash(), block);
+            
+            if (getChainHead().getHeader().getHash().equals(block.getPrevBlockHash())) {
+                for (final ListenerRegistration<BlockChainListener> registration : listeners) {
+                    if (registration.executor == Threading.SAME_THREAD) {
+                        registration.listener.notifyNewBestHeader(block);
+                    } else {
+                        registration.executor.execute(new Runnable() {
+                            @Override
+                            public void run() {
+                                registration.listener.notifyNewBestHeader(block);
+                            }
+                        });
+                    }
+                }                
+            }
+            
+            return true;
+
+        } catch (BlockStoreException e) {
+            // TODO: Figure out a better way to propagate this exception to the user.
+            throw new RuntimeException(e);
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    public Map<Sha256Hash, Block> getHeadersWaitingForItsTransactions() {
+        return headersWaitingForItsTransactions;
+    }
+
+    
+    
     // filteredTxHashList contains all transactions, filteredTxn just a subset
     private boolean add(Block block, boolean tryConnecting,
                         @Nullable List<Sha256Hash> filteredTxHashList, @Nullable Map<Sha256Hash, Transaction> filteredTxn)
@@ -413,6 +492,9 @@ public abstract class AbstractBlockChain {
                 checkDifficultyTransitions(storedPrev, block);
                 connectBlock(block, storedPrev, shouldVerifyTransactions(), filteredTxHashList, filteredTxn);
             }
+            
+            // removes the block from headersWaitingForItsTransactions if it was there
+            headersWaitingForItsTransactions.remove(block.getHash());
 
             if (tryConnecting)
                 tryConnectingOrphans();
@@ -471,8 +553,7 @@ public abstract class AbstractBlockChain {
             TransactionOutputChanges txOutChanges = null;
             if (shouldVerifyTransactions())
                 txOutChanges = connectTransactions(storedPrev.getHeight() + 1, block);
-            StoredBlock newStoredBlock = addToBlockStore(storedPrev,
-                    block.transactions == null ? block : block.cloneAsHeader(), txOutChanges);
+            StoredBlock newStoredBlock = addToBlockStore(storedPrev, block, txOutChanges);
             setChainHead(newStoredBlock);
             log.debug("Chain is now {} blocks high, running listeners", newStoredBlock.getHeight());
             informListenersForNewBlock(block, NewBlockType.BEST_CHAIN, filteredTxHashList, filteredTxn, newStoredBlock);
@@ -482,7 +563,25 @@ public abstract class AbstractBlockChain {
             // Note that we send the transactions to the wallet FIRST, even if we're about to re-organize this block
             // to become the new best chain head. This simplifies handling of the re-org in the Wallet class.
             StoredBlock newBlock = storedPrev.build(block);
-            boolean haveNewBestChain = newBlock.moreWorkThan(head);
+            int chainWorkComparison = newBlock.getChainWork().compareTo(head.getChainWork());
+            boolean haveNewBestChain = false;
+            if (chainWorkComparison > 0) {
+                haveNewBestChain = true;
+            } else if (chainWorkComparison < 0) {
+                haveNewBestChain = false;                
+            } else {
+                if (useLowerHashPolicy) {
+                    // Lowest hash policy
+                    // make haveNewBestChain true if the new block hash is lower
+                    BigInteger newBlockHashBigInteger = newBlock.getHeader().getHash().toBigInteger();
+                    BigInteger headHashBigInteger = head.getHeader().getHash().toBigInteger();
+                    haveNewBestChain = newBlockHashBigInteger.compareTo(headHashBigInteger) < 0;                    
+                } else {
+                    // double the bet policy
+                    // make haveNewBestChain true if the new block was mined by me
+                    haveNewBestChain = block.getTransactions().get(0).getOutput(0).isMine(wallet);                    
+                }
+            }
             if (haveNewBestChain) {
                 log.info("Block is causing a re-organize");
             } else {
@@ -667,11 +766,20 @@ public abstract class AbstractBlockChain {
                 if (expensiveChecks && cursor.getHeader().getTimeSeconds() <= getMedianTimestampOfRecentBlocks(cursor.getPrev(blockStore), blockStore))
                     throw new VerificationException("Block's timestamp is too early during reorg");
                 TransactionOutputChanges txOutChanges;
-                if (cursor != newChainHead || block == null)
-                    txOutChanges = connectTransactions(cursor);
-                else
-                    txOutChanges = connectTransactions(newChainHead.getHeight(), block);
-                storedNewHead = addToBlockStore(storedNewHead, cursor.getHeader(), txOutChanges);
+                Block cursorBlock = null;
+                if (cursor != newChainHead || block == null) {
+                    txOutChanges = connectTransactions(cursor);                    
+                    cursorBlock = cursor.getHeader();
+                    FullPrunedBlockStore fullPrunedBlockStore = (FullPrunedBlockStore) getBlockStore();
+                    StoredUndoableBlock storedUndoableBlock = fullPrunedBlockStore.getUndoBlock(cursor.getHeader().getHash());
+                    for (Transaction t : storedUndoableBlock.getTransactions()) {
+                        cursorBlock.addTransaction(t);                    
+                    }
+                } else {
+                    txOutChanges = connectTransactions(newChainHead.getHeight(), block);                        
+                    cursorBlock = block;
+                }
+                storedNewHead = addToBlockStore(storedNewHead, cursorBlock, txOutChanges);                    
             }
         } else {
             // (Finally) write block to block store
@@ -982,15 +1090,25 @@ public abstract class AbstractBlockChain {
     }
 
     /** Returns true if the given block is currently in the orphan blocks list. */
-    public boolean isOrphan(Sha256Hash block) {
+    public boolean isOrphan(Sha256Hash blockHash) {
         lock.lock();
         try {
-            return orphanBlocks.containsKey(block);
+            return orphanBlocks.containsKey(blockHash);
         } finally {
             lock.unlock();
         }
     }
 
+    public Block getOrphan(Sha256Hash blockHash) {
+        lock.lock();
+        try {
+            return orphanBlocks.get(blockHash).block;
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    
     /**
      * Returns an estimate of when the given block will be reached, assuming a perfect 10 minute average for each
      * block. This is useful for turning transaction lock times into human readable times. Note that a height in
@@ -1083,5 +1201,13 @@ public abstract class AbstractBlockChain {
         falsePositiveRate = 0;
         falsePositiveTrend = 0;
         previousFalsePositiveRate = 0;
+    }
+    
+    public void setUseLowerHashPolicy(boolean useLowerHashPolicy) {
+        this.useLowerHashPolicy = useLowerHashPolicy;
+    }
+    
+    public ReentrantLock getLock() {
+        return lock;
     }
 }

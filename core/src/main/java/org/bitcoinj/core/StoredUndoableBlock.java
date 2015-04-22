@@ -41,7 +41,12 @@ public class StoredUndoableBlock implements Serializable {
         this.transactions = null;
         this.txOutChanges = txOutChanges;
     }
-    
+   // NIMBLECOIN
+   public StoredUndoableBlock(Sha256Hash hash, List<Transaction> transactions, TransactionOutputChanges txOutChanges) {
+        this.blockHash = hash;
+        this.transactions = transactions;
+        this.txOutChanges = txOutChanges;
+    }    
     public StoredUndoableBlock(Sha256Hash hash, List<Transaction> transactions) {
         this.blockHash = hash;
         this.txOutChanges = null;

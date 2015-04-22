@@ -45,4 +45,14 @@ public abstract class InboundMessageQueuer extends PeerSocketHandler {
         }
         inboundMessages.offer(m);
     }
+    // NIMBLECOIN
+    @Override
+    protected void processHighPriorityMessage(long nodeId, Message message) {
+        throw new UnsupportedOperationException();
+    }
+    // NIMBLECOIN
+    @Override
+    protected long getSelfNodeId() {
+        throw new UnsupportedOperationException();
+    }
 }

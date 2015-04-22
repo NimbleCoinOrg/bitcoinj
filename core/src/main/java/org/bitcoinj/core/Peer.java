@@ -56,6 +56,7 @@ public class Peer extends PeerSocketHandler {
 
     protected final ReentrantLock lock = Threading.lock("peer");
 
+    private final PeerGroup peerGroup;
     private final NetworkParameters params;
     private final AbstractBlockChain blockChain;
     private final Context context;
@@ -88,6 +89,9 @@ public class Peer extends PeerSocketHandler {
     // so we can use this to calculate the height of the peers chain, by adding it to the initial height in the version
     // message. This method can go wrong if the peer re-orgs onto a shorter (but harder) chain, however, this is rare.
     private final AtomicInteger blocksAnnounced = new AtomicInteger();
+    // A class that tracks recent transactions that have been broadcast across the network, counts how many
+    // peers announced them and updates the transaction confidence data. It is passed to each Peer.
+    private final MemoryPool memoryPool;
     // Each wallet added to the peer will be notified of downloaded transaction data.
     private final CopyOnWriteArrayList<Wallet> wallets;
     // A time before which we only download block headers, after that point we download block bodies.
@@ -153,6 +157,13 @@ public class Peer extends PeerSocketHandler {
     private final SettableFuture<Peer> connectionOpenFuture = SettableFuture.create();
     private final SettableFuture<Peer> versionHandshakeFuture = SettableFuture.create();
 
+  // True if we tried to connect to this peer. False if this peer tried to connect to us. 
+  
+    private boolean initiatedByPeer = false;
+
+    // Should be a Set but could not find a size limited set in java
+    Cache<Sha256Hash, Sha256Hash> headersThisPeerKnowsAbout;
+    
     /**
      * <p>Construct a peer that reads/writes from the given block chain.</p>
      *
@@ -165,8 +176,9 @@ public class Peer extends PeerSocketHandler {
      * <p>The remoteAddress provided should match the remote address of the peer which is being connected to, and is
      * used to keep track of which peers relayed transactions and offer more descriptive logging.</p>
      */
-    public Peer(NetworkParameters params, VersionMessage ver, @Nullable AbstractBlockChain chain, PeerAddress remoteAddress) {
-        this(params, ver, remoteAddress, chain);
+    public Peer(PeerGroup peerGroup, NetworkParameters params, VersionMessage ver, @Nullable AbstractBlockChain chain, PeerAddress remoteAddress) {
+        this(peerGroup, params, ver, remoteAddress, chain, null);
+        //builder.b
     }
 
     /**
@@ -183,28 +195,50 @@ public class Peer extends PeerSocketHandler {
      * <p>The remoteAddress provided should match the remote address of the peer which is being connected to, and is
      * used to keep track of which peers relayed transactions and offer more descriptive logging.</p>
      */
-    public Peer(NetworkParameters params, VersionMessage ver, PeerAddress remoteAddress,
-                @Nullable AbstractBlockChain chain) {
-        this(params, ver, remoteAddress, chain, true);
+    public Peer(PeerGroup peerGroup, NetworkParameters params, VersionMessage ver, PeerAddress remoteAddress,
+            @Nullable AbstractBlockChain chain, @Nullable MemoryPool mempool) {
+        this(peerGroup, params, ver, remoteAddress, chain, mempool, true);
     }
 
     /**
-     * <p>Construct a peer that reads/writes from the given block chain. Transactions stored in a {@link org.bitcoinj.core.TxConfidenceTable}
-     * will have their confidence levels updated when a peer announces it, to reflect the greater likelyhood that
+     * <p>Construct a peer that reads/writes from the given block chain and memory pool. Transactions stored in a memory
+     * pool will have their confidence levels updated when a peer announces it, to reflect the greater likelyhood that
      * the transaction is valid.</p>
      *
      * <p>Note that this does <b>NOT</b> make a connection to the given remoteAddress, it only creates a handler for a
      * connection. If you want to create a one-off connection, create a Peer and pass it to
-     * {@link org.bitcoinj.net.NioClientManager#openConnection(java.net.SocketAddress, org.bitcoinj.net.StreamParser)}
+     * {@link com.google.bitcoin.net.NioClientManager#openConnection(java.net.SocketAddress, com.google.bitcoin.net.StreamParser)}
+     * or
+     * {@link com.google.bitcoin.net.NioClient#NioClient(java.net.SocketAddress, com.google.bitcoin.net.StreamParser, int)}.</p>
+     *
+     * <p>The remoteAddress provided should match the remote address of the peer which is being connected to, and is
+     * used to keep track of which peers relayed transactions and offer more descriptive logging.</p>
+     */
+    public Peer(PeerGroup peerGroup, NetworkParameters params, VersionMessage ver, PeerAddress remoteAddress,
+                @Nullable AbstractBlockChain chain, @Nullable MemoryPool mempool, boolean downloadTxDependencies) {
+        this(peerGroup, params, ver, remoteAddress, chain, mempool, downloadTxDependencies, false);
+    }
+    
+    
+   /**
+     * <p>Construct a peer that reads/writes from the given block chain and memory pool. Transactions stored in a memory
+     * pool will have their confidence levels updated when a peer announces it, to reflect the greater likelyhood that
+     * the transaction is valid.</p>
+     *
+     * <p>Note that this does <b>NOT</b> make a connection to the given remoteAddress, it only creates a handler for a
+     * connection. If you want to create a one-off connection, create a Peer and pass it to
+     * {@link com.google.bitcoin.net.NioClientManager#openConnection(java.net.SocketAddress, com.google.bitcoin.net.StreamParser)}
      * or
      * {@link org.bitcoinj.net.NioClient#NioClient(java.net.SocketAddress, org.bitcoinj.net.StreamParser, int)}.</p>
      *
      * <p>The remoteAddress provided should match the remote address of the peer which is being connected to, and is
      * used to keep track of which peers relayed transactions and offer more descriptive logging.</p>
      */
-    public Peer(NetworkParameters params, VersionMessage ver, PeerAddress remoteAddress,
-                @Nullable AbstractBlockChain chain, boolean downloadTxDependencies) {
+    public Peer(PeerGroup peerGroup, NetworkParameters params, VersionMessage ver, PeerAddress remoteAddress,
+				@Nullable AbstractBlockChain chain, @Nullable MemoryPool mempool, boolean downloadTxDependencies, 
+				boolean initiatedByPeer) {
         super(params, remoteAddress);
+        this.peerGroup = peerGroup;
         this.params = Preconditions.checkNotNull(params);
         this.versionMessage = Preconditions.checkNotNull(ver);
         this.vDownloadTxDependencies = chain != null && downloadTxDependencies;
@@ -218,6 +252,10 @@ public class Peer extends PeerSocketHandler {
         this.pendingPings = new CopyOnWriteArrayList<PendingPing>();
         this.wallets = new CopyOnWriteArrayList<Wallet>();
         this.context = Context.get();
+        this.memoryPool = mempool;
+        this.initiatedByPeer = initiatedByPeer;
+        this.headersThisPeerKnowsAbout = CacheBuilder.newBuilder().maximumSize(100).build();
+ 
     }
 
     /**
@@ -234,8 +272,8 @@ public class Peer extends PeerSocketHandler {
      * <p>The remoteAddress provided should match the remote address of the peer which is being connected to, and is
      * used to keep track of which peers relayed transactions and offer more descriptive logging.</p>
      */
-    public Peer(NetworkParameters params, AbstractBlockChain blockChain, PeerAddress peerAddress, String thisSoftwareName, String thisSoftwareVersion) {
-        this(params, new VersionMessage(params, blockChain.getBestChainHeight()), blockChain, peerAddress);
+    public Peer(PeerGroup peerGroup, NetworkParameters params, AbstractBlockChain blockChain, PeerAddress peerAddress, String thisSoftwareName, String thisSoftwareVersion) {
+        this(peerGroup, params, new VersionMessage(params, blockChain.getBestChainHeight(), true, blockChain.shouldVerifyTransactions(), params.getPort(), false), blockChain, peerAddress);
         this.versionMessage.appendToSubVer(thisSoftwareName, thisSoftwareVersion, null);
     }
 
@@ -279,7 +317,18 @@ public class Peer extends PeerSocketHandler {
             return addr.toString();
         }
     }
+    
+    @Override
+    public boolean equals(Object o) {
+        if (!(o instanceof Peer)) return false;
+        Peer other = (Peer) o;
+        return other.peerAddress.equals(this.peerAddress);
+    }
 
+    @Override
+    public int hashCode() {
+        return peerAddress.hashCode();
+    }
     @Override
     protected void timeoutOccurred() {
         super.timeoutOccurred();
@@ -307,7 +356,7 @@ public class Peer extends PeerSocketHandler {
         // from us until they send their version message back.
         PeerAddress address = getAddress();
         log.info("Announcing to {} as: {}", address == null ? "Peer" : address.toSocketAddress(), versionMessage.subVer);
-        sendMessage(versionMessage);
+        sendLowPriorityMessage(versionMessage);
         connectionOpenFuture.set(this);
         // When connecting, the remote peer sends us a version message with various bits of
         // useful data in it. We need to know the peer protocol version before we can talk to it.
@@ -324,9 +373,24 @@ public class Peer extends PeerSocketHandler {
     public ListenableFuture<Peer> getVersionHandshakeFuture() {
         return versionHandshakeFuture;
     }
-
+    private enum TransportProtocol {TCP, UDP};
+    
     @Override
-    protected void processMessage(Message m) throws Exception {
+    protected void processHighPriorityMessage(long nodeId, Message m) {
+        if(vPeerVersionMessage.getNonce() == nodeId) {
+            maybeDelay(m);
+            log.info("{}: Received high priority message {} {}", getAddress(), m.getClass().getSimpleName(), m.toString());
+            if (m instanceof PushHeader) {
+                processPushHeader((PushHeader) m, TransportProtocol.UDP);
+            }
+        }        
+    }
+    
+    protected void processLowPriorityMessage(Message m) throws Exception {
+        maybeDelay(m);
+        if (!(m instanceof Ping) && ! (m instanceof Pong)) {        
+            log.info("{}: Received low priority message {} {}", getAddress(), m.getClass().getSimpleName(), m.toString());
+        }
         // Allow event listeners to filter the message stream. Listeners are allowed to drop messages by
         // returning null.
         for (ListenerRegistration<PeerEventListener> registration : eventListeners) {
@@ -355,6 +419,12 @@ public class Peer extends PeerSocketHandler {
             // This is sent to us when we did a getdata on some transactions that aren't in the peers memory pool.
             // Because NotFoundMessage is a subclass of InventoryMessage, the test for it must come before the next.
             processNotFoundMessage((NotFoundMessage) m);
+        } else if (m instanceof PushHeader) {
+            processPushHeader((PushHeader) m, TransportProtocol.TCP);
+        } else if (m instanceof PushHeaderAck) {
+            processPushHeaderAck((PushHeaderAck) m);
+        } else if (m instanceof PushTransactionList) {
+            processPushTransactionList((PushTransactionList) m);
         } else if (m instanceof InventoryMessage) {
             processInv((InventoryMessage) m);
         } else if (m instanceof Block) {
@@ -405,6 +475,8 @@ public class Peer extends PeerSocketHandler {
             processUTXOMessage((UTXOsMessage) m);
         } else if (m instanceof RejectMessage) {
             log.error("{} {}: Received {}", this, getPeerVersionMessage().subVer, m);
+        } else if (m instanceof GetBlocksMessage) {
+            processGetBlocks((GetBlocksMessage)m);
         } else {
             log.warn("{}: Received unhandled message: {}", this, m);
         }
@@ -433,7 +505,7 @@ public class Peer extends PeerSocketHandler {
         future.set(m);
     }
 
-    private void processVersionMessage(VersionMessage m) throws ProtocolException {
+    private void processVersionMessage(VersionMessage m) throws ProtocolException, IOException {
         if (vPeerVersionMessage != null)
             throw new ProtocolException("Got two version messages from peer");
         vPeerVersionMessage = m;
@@ -458,7 +530,11 @@ public class Peer extends PeerSocketHandler {
         if (!vPeerVersionMessage.hasBlockChain() ||
                 (!params.allowEmptyPeerChain() && vPeerVersionMessage.bestHeight <= 0)) {
             // Shut down the channel
-            throw new ProtocolException("Peer does not have a copy of the block chain.");
+            log.info("Peer does not have a copy of the block chain.");
+            //throw new ProtocolException("Peer does not have a copy of the block chain.");
+        }
+        if (vPeerVersionMessage.acceptUdp()) {
+            writeTarget.setUDPPort(vPeerVersionMessage.myAddr.getPort());
         }
         versionHandshakeFuture.set(this);
     }
@@ -511,6 +587,145 @@ public class Peer extends PeerSocketHandler {
             log.error("Failed to check signature: bug in platform libraries?", t);
         }
     }
+    
+    
+    private void processPushHeader(PushHeader m, TransportProtocol transportProtocol) {
+        if (blockChain == null) {
+            // Can happen if we are receiving unrequested data, or due to programmer error.
+            log.warn("Received pushheader when Peer is not configured with a chain.");
+            return;
+        }
+
+        headersThisPeerKnowsAbout.put(m.getHash(), m.getHash());
+
+        if (transportProtocol.equals(TransportProtocol.UDP)) {
+            sendLowPriorityMessage(new PushHeaderAck(params, m.getHash()));            
+        }
+        
+        MessageIdentifier messageIdentifier = new MessageIdentifier(m.getClass(), m.getHash());
+        boolean shouldProcess = peerGroup.shouldProcessReceivedMessage(messageIdentifier);
+        if (!shouldProcess) return;
+        
+        try {
+            Block header = m.getBlockHeader();
+            if (blockChain.addHeaderWaitingForItsTransactions(header)) {                
+                // The block was successfully added to headersWaitingForItsTransactions
+                peerGroup.broadcastPushHeader(m, this);                    
+            }
+                
+        } catch (VerificationException e) {
+            log.warn("Block header verification failed", e);
+        }
+        
+    }
+
+    private void processPushHeaderAck(PushHeaderAck m) {
+        headersThisPeerKnowsAbout.put(m.getHash(), m.getHash());        
+    }
+    
+
+    private void processPushTransactionList(final PushTransactionList m) throws BlockStoreException {
+        if (blockChain == null) {
+            // Can happen if we are receiving unrequested data, or due to programmer error.
+            log.warn("Received pushtxlist when Peer is not configured with a chain.");
+            return;
+        }
+        
+        MessageIdentifier messageIdentifier = new MessageIdentifier(m.getClass(), m.getHash());
+        boolean shouldProcess = peerGroup.shouldProcessReceivedMessage(messageIdentifier);
+        if (!shouldProcess) return;
+
+        
+        final Sha256Hash blockHash = m.getBlockHash();
+        final Block blockHeader = blockChain.getHeadersWaitingForItsTransactions().get(blockHash);
+        if (blockHeader==null) {
+            log.info("Received pushtxlist but the pushheader not arrived yet or was already processed.");
+            if (!blockChain.isOrphan(blockHash) && blockChain.getBlockStore().get(blockHash)==null) {
+                InventoryMessage inv = new InventoryMessage(params);
+                inv.addItem(new InventoryItem(InventoryItem.Type.Block, blockHash));
+                processInv(inv);                
+            }
+            return;                
+        }
+        List<Sha256Hash> transactionHashes = m.getTransactionHashes();
+        
+        if (!blockHeader.getMerkleRoot().equals(MerkleTreeUtils.calculateHashesMerkleRoot(transactionHashes))) {
+            log.warn("pushtxlist's merkle root does not match pushheader's merkle root .");
+            return;                
+        }
+        
+        Transaction coinbaseTransaction = m.getCoinbaseTransaction();
+        coinbaseTransaction.verify();
+        
+        GetDataMessage getdata = new GetDataMessage(params);
+
+        List<ListenableFuture<Transaction>> futures = Lists.newArrayList();
+        futures.add(Futures.immediateFuture(coinbaseTransaction));
+
+        for (Sha256Hash transactionHash : transactionHashes) {
+            if (coinbaseTransaction.getHash().equals(transactionHash)) continue;
+            if (memoryPool.get(transactionHash)!=null) {
+                // Some other peer already announced this so don't download.
+                Transaction transaction = memoryPool.get(transactionHash);
+                futures.add(Futures.immediateFuture(transaction));
+            } else {
+                log.debug("{}: getdata on tx {}", getAddress(), transactionHash);
+                getdata.addTransaction(transactionHash);
+                GetDataRequest req = new GetDataRequest();
+                req.hash = transactionHash;
+                req.future = SettableFuture.create();
+                futures.add(req.future);
+                getDataFutures.add(req);
+                
+            }
+        }
+
+        ListenableFuture<List<Transaction>> successful = Futures.successfulAsList(futures);
+
+        if (!getdata.getItems().isEmpty()) {
+            // This will cause us to receive a bunch of block or tx messages.
+            sendLowPriorityMessage(getdata);
+        }
+        
+        Futures.addCallback(successful, new FutureCallback<List<Transaction>>() {
+            public void onSuccess(List<Transaction> transactions) {
+                log.info("{}: I have all the transactions for received PushTransactionList for block {}!", getAddress(), m.getBlockHash());
+                Block block = blockHeader;
+                for (Transaction transaction : transactions) {
+                    block.addTransaction(transaction);
+                }                    
+                try {
+                    if (blockChain.add(block)) {
+                        peerGroup.broadcastLowPriorityMessage(m, Peer.this);
+                    } else {
+                        lock.lock();
+                        try {
+                            if (downloadBlockBodies) {
+                                final Block orphanRoot = checkNotNull(blockChain.getOrphanRoot(m.getHash()));
+                                blockChainDownloadLocked(orphanRoot.getHash());
+                            } else {
+                                log.info("Did not start chain download on solved block due to in-flight header download.");
+                            }
+                        } finally {
+                            lock.unlock();
+                        }
+                    }
+                } catch (VerificationException e) {
+                    // We don't want verification failures to kill the thread.
+                    log.warn("{}: Block verification failed", getAddress(), e);
+                } catch (PrunedException e) {
+                    // Unreachable when in SPV mode.
+                    throw new RuntimeException(e);
+                }                    
+
+            }
+
+            public void onFailure(Throwable throwable) {
+                log.error("Could not download transactions of block {}", blockHash);
+                log.error("Error was: ", throwable);
+            }
+        });
+    }
 
     private void processHeaders(HeadersMessage m) throws ProtocolException {
         // Runs in network loop thread for this peer.
@@ -539,17 +754,24 @@ public class Peer extends PeerSocketHandler {
             checkState(!downloadBlockBodies, toString());
             for (int i = 0; i < m.getBlockHeaders().size(); i++) {
                 Block header = m.getBlockHeaders().get(i);
+                MessageIdentifier messageIdentifier = new MessageIdentifier(m.getClass(), header.getHash());
+                boolean shouldProcess = peerGroup.shouldProcessReceivedMessage(messageIdentifier);
+                if (!shouldProcess) continue;
+                
                 // Process headers until we pass the fast catchup time, or are about to catch up with the head
                 // of the chain - always process the last block as a full/filtered block to kick us out of the
                 // fast catchup mode (in which we ignore new blocks).
                 boolean passedTime = header.getTimeSeconds() >= fastCatchupTimeSecs;
                 boolean reachedTop = blockChain.getBestChainHeight() >= vPeerVersionMessage.bestHeight;
                 if (!passedTime && !reachedTop) {
+                    
+                    if (SPV)
                     if (!vDownloadData) {
                         // Not download peer anymore, some other peer probably became better.
                         log.info("Lost download peer status, throwing away downloaded headers.");
                         return;
                     }
+                 
                     if (blockChain.add(header)) {
                         // The block was successfully linked into the chain. Notify the user of our progress.
                         invokeOnBlocksDownloaded(header, null);
@@ -601,21 +823,121 @@ public class Peer extends PeerSocketHandler {
             if (listenerItems == null) continue;
             items.addAll(listenerItems);
         }
+        // BEGIN NIMBLECOIN
+        boolean resendChainHead = false;
+        if (blockChain.shouldVerifyTransactions()){
+            FullPrunedBlockStore fullPrunedBlockStore = (FullPrunedBlockStore) blockChain.getBlockStore();
+            for (InventoryItem item: getdata.getItems()) {
+                if (item.type.equals(InventoryItem.Type.Block)) {
+                    blockChain.getLock().lock();
+                    try {                        
+                        if (blockChain.isOrphan(item.hash)) {
+                            Block block = blockChain.getOrphan(item.hash);
+                            log.info("GetData requested for orphan block {}", item.hash);
+                            items.add(block);
+                        } else {
+                            Block block = fullPrunedBlockStore.get(item.hash).getHeader().cloneAsHeader();
+                            StoredUndoableBlock storedUndoableBlock = fullPrunedBlockStore.getUndoBlock(block.getHash());
+                            for (Transaction t : storedUndoableBlock.getTransactions()) {
+                                block.addTransaction(t);                    
+                            }                    
+                            items.add(block);
+                            if (block.equals(lastInvNumber500SentAsPartOfBlockChainUpload)) {
+                                resendChainHead = true;
+                            }                        
+                        }
+                    } finally {
+                        blockChain.getLock().unlock();
+                    }
+                }
+            }            
+        }
+		// END NIMBLECOIN
+        
         if (items.size() == 0) {
             return;
         }
         log.info("{}: Sending {} items gathered from listeners to peer", getAddress(), items.size());
         for (Message item : items) {
             sendMessage(item);
+        } 
+        // BEGIN NIMBLECOIN
+        if (resendChainHead) {
+            InventoryMessage inv = new InventoryMessage(params);
+            inv.addBlock(blockChain.getChainHead().getHeader());
+            sendLowPriorityMessage(inv);
+        }
+        // END NIMBLECOIN
+     // BEGIN NIMBLECOIN
+    /**
+     * During blockchain upload send invs of 500 blocks. lastInvNumber500SentAsPartOfBlockChainUpload is the last
+     * block sent. If the peer sends a getdata for that block, after the standard block response, send an inv with
+     * the chain head, so the peer sends a new getblocks 
+     */
+    private Block lastInvNumber500SentAsPartOfBlockChainUpload = null;
+    
+    private void processGetBlocks(GetBlocksMessage getblocks) throws BlockStoreException {
+        BlockStore store = blockChain.getBlockStore();
+        StoredBlock lastKnownBlockInLocator = null;
+        for (Sha256Hash locatorHash: getblocks.getLocator()) {
+            StoredBlock storedBlock = store.get(locatorHash);
+            if (storedBlock!=null) {
+                lastKnownBlockInLocator = storedBlock;
+                break;
+            }
+        }
+        if (lastKnownBlockInLocator==null) {
+            log.warn("{}: no known hash in locator: {}", getAddress(), getblocks.toString());
+            return;
+        }
+        Sha256Hash stopHash = getblocks.getStopHash();
+        StoredBlock stopBlock;
+        if (stopHash.equals(Sha256Hash.ZERO_HASH)) {
+            stopBlock = blockChain.getChainHead();
+        } else {
+            stopBlock = store.get(stopHash);
+            if (stopBlock==null) {
+                log.warn("{}: no block for stopHash: {}", getAddress(), getblocks.getStopHash());
+                return;
+            }            
+        }         
+        List<StoredBlock> fullResponseList = new LinkedList<StoredBlock>();
+        StoredBlock currentBlock = stopBlock;
+        while (!currentBlock.equals(lastKnownBlockInLocator) && 
+               !currentBlock.getHeader().getHash().equals(params.getGenesisBlock().getHash())) {
+            fullResponseList.add(currentBlock);
+            currentBlock = currentBlock.getPrev(store);            
+        }
+        InventoryMessage invResponse = new InventoryMessage(params);
+        for (int i = 0; i < Math.min(500, fullResponseList.size()); i++) {
+            currentBlock = fullResponseList.get(fullResponseList.size()-i-1);
+            invResponse.addBlock(currentBlock.getHeader());
+            if (i==499) {
+                lastInvNumber500SentAsPartOfBlockChainUpload = currentBlock.getHeader();
+            }            
+        }
+        sendLowPriorityMessage(invResponse);        
+    }
         }
     }
+    // END NIMBLECOIN
 
     private void processTransaction(final Transaction tx) throws VerificationException {
         // Check a few basic syntax issues to ensure the received TX isn't nonsense.
         tx.verify();
+        // BEGIN NIMBLECOIN
+        MessageIdentifier messageIdentifier = new MessageIdentifier(tx.getClass(), tx.getHash());
+        boolean shouldProcess = peerGroup.shouldProcessReceivedMessage(messageIdentifier);
+        if (!shouldProcess) return;
+        final Transaction fTx;
+        // END NIMBLECOIN
         lock.lock();
         try {
             log.debug("{}: Received tx {}", getAddress(), tx.getHashAsString());
+            if (memoryPool != null) {
+                // We may get back a different transaction object.
+                tx = memoryPool.seen(tx, getAddress());
+            }	
             // Label the transaction as coming in from the P2P network (as opposed to being created by us, direct import,
             // etc). This helps the wallet decide how to risk analyze it later.
             //
@@ -834,11 +1156,18 @@ public class Peer extends PeerSocketHandler {
             return;
         }
         // Did we lose download peer status after requesting block data?
-        if (!vDownloadData) {
+        if (SPV) {
+         if (!vDownloadData) {
             log.debug("{}: Received block we did not ask for: {}", getAddress(), m.getHashAsString());
             return;
+         }
+         pendingBlockDownloads.remove(m.getHash());
+
         }
-        pendingBlockDownloads.remove(m.getHash());
+        MessageIdentifier messageIdentifier = new MessageIdentifier(m.getClass(), m.getHash());
+        boolean shouldProcess = peerGroup.shouldProcessReceivedMessage(messageIdentifier);
+        if (!shouldProcess) return;
+         
         try {
             // Otherwise it's a block sent to us because the peer thought we needed it, so add it to the block chain.
             if (blockChain.add(m)) {
@@ -888,10 +1217,13 @@ public class Peer extends PeerSocketHandler {
     private void endFilteredBlock(FilteredBlock m) {
         if (log.isDebugEnabled())
             log.debug("{}: Received broadcast filtered block {}", getAddress(), m.getHash().toString());
+        if (SPV)
         if (!vDownloadData) {
             log.debug("{}: Received block we did not ask for: {}", getAddress(), m.getHash().toString());
             return;
         }
+        
+
         if (blockChain == null) {
             log.warn("Received filtered block but was not configured with an AbstractBlockChain");
             return;
@@ -899,7 +1231,8 @@ public class Peer extends PeerSocketHandler {
         // Note that we currently do nothing about peers which maliciously do not include transactions which
         // actually match our filter or which simply do not send us all the transactions we need: it can be fixed
         // by cross-checking peers against each other.
-        pendingBlockDownloads.remove(m.getBlockHeader().getHash());
+        if (SPV) 
+           pendingBlockDownloads.remove(m.getBlockHeader().getHash());
         try {
             // It's a block sent to us because the peer thought we needed it, so maybe add it to the block chain.
             // The FilteredBlock m here contains a list of hashes, and may contain Transaction objects for a subset
@@ -1028,16 +1361,20 @@ public class Peer extends PeerSocketHandler {
         List<InventoryItem> blocks = new LinkedList<InventoryItem>();
 
         for (InventoryItem item : items) {
-            switch (item.type) {
-                case Transaction:
-                    transactions.add(item);
-                    break;
-                case Block:
-                    blocks.add(item);
-                    break;
-                default:
-                    throw new IllegalStateException("Not implemented: " + item.type);
-            }
+            MessageIdentifier messageIdentifier = new MessageIdentifier(inv.getClass(), item.hash);
+            boolean shouldProcess = peerGroup.shouldProcessReceivedMessage(messageIdentifier);
+            if (shouldProcess) {
+                switch (item.type) {
+                    case Transaction:
+                        transactions.add(item);
+                        break;
+                    case Block:
+                        blocks.add(item);
+                        break;
+                    default:
+                        throw new IllegalStateException("Not implemented: " + item.type);
+                }                
+            }            
         }
 
         final boolean downloadData = this.vDownloadData;
@@ -1090,7 +1427,7 @@ public class Peer extends PeerSocketHandler {
 
         lock.lock();
         try {
-            if (blocks.size() > 0 && downloadData && blockChain != null) {
+            if (blocks.size() > 0 && (downloadData || !SPV) && blockChain != null) {
                 // Ideally, we'd only ask for the data here if we actually needed it. However that can imply a lot of
                 // disk IO to figure out what we've got. Normally peers will not send us inv for things we already have
                 // so we just re-request it here, and if we get duplicates the block chain / wallet will filter them out.
@@ -1120,6 +1457,7 @@ public class Peer extends PeerSocketHandler {
                             } else {
                                 getdata.addItem(item);
                             }
+                            if (SPV)
                             pendingBlockDownloads.add(item.hash);
                         }
                     }
@@ -1341,15 +1679,15 @@ public class Peer extends PeerSocketHandler {
         // TODO: peer might still have blocks that we don't have, and even have a heavier
         // chain even if the chain block count is lower.
         final int blocksLeft = getPeerBlockHeightDifference();
+        for (final ListenerRegistration<PeerEventListener> registration : eventListeners) {
+            registration.executor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    registration.listener.onChainDownloadStarted(Peer.this, blocksLeft);
+                }
+            });
+        }
         if (blocksLeft >= 0) {
-            for (final ListenerRegistration<PeerEventListener> registration : eventListeners) {
-                registration.executor.execute(new Runnable() {
-                    @Override
-                    public void run() {
-                        registration.listener.onChainDownloadStarted(Peer.this, blocksLeft);
-                    }
-                });
-            }
             // When we just want as many blocks as possible, we can set the target hash to zero.
             lock.lock();
             try {
@@ -1626,7 +1964,50 @@ public class Peer extends PeerSocketHandler {
     public BloomFilter getBloomFilter() {
         return vBloomFilter;
     }
+    
+    /**
+     * True if we tried to connect to this peer. False if this peer tried to connect to us. 
+     */
+    public boolean getInitiatedByPeer() {
+        return initiatedByPeer;
+    }
+  
+    /** NIMBLECOIN
+     * Delay reading to emulate real network behavior. Used for testing purposes. 
+     * @param bytes
+     */
+    protected void maybeDelay(Message m) {
+        try {
+            if (params instanceof RegTestParams) {
+                int delay = 0;
+                if (!(params instanceof NetboxParams)) {
+                    delay = 150 + m.getMessageSize()/10000;                    
+                } else {
+                    double DELAY_MULTIPLIER = 1.1d;
+                    double distance = 0;
+                    if (versionMessage!=null && vPeerVersionMessage!=null) {
+                        distance = NetboxParams.get().getDistance((int)versionMessage.getNonce(),(int) vPeerVersionMessage.getNonce());                        
+                    }
+                    delay = (int) (distance * DELAY_MULTIPLIER) + m.getMessageSize()/10000;                    
+                }
+                if (!(m instanceof Ping) && ! (m instanceof Pong)) log.info("About to emulate delay of {}ms", delay);
+                Thread.sleep(delay);
+            }
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+    }
 
+   @Override // NIMBLECOIN
+    protected long getSelfNodeId() {
+        return versionMessage.getNonce();
+    }
+    // NIMBLECOIN
+    public boolean knowsAboutHeader(Sha256Hash hash) {
+        return headersThisPeerKnowsAbout.getIfPresent(hash) != null;
+    }
+  
+       
     /**
      * Sends a query to the remote peer asking for the unspent transaction outputs (UTXOs) for the given outpoints,
      * with the memory pool included. The result should be treated only as a hint: it's possible for the returned

@@ -80,6 +80,10 @@ public class PeerGroup implements TransactionBroadcaster {
     private volatile int vMaxPeersToDiscoverCount = 100;
 
     protected final ReentrantLock lock = Threading.lock("peergroup");
+ 
+    //Key=Message Identifier, Value=number of times the message was received
+    ConcurrentMap<MessageIdentifier, AtomicInteger> receivedMessages = new ConcurrentHashMap<MessageIdentifier, AtomicInteger>();
+    
 
     private final NetworkParameters params;
     private final Context context;
@@ -96,7 +100,7 @@ public class PeerGroup implements TransactionBroadcaster {
     private volatile boolean vUsedUp;
 
     // Addresses to try to connect to, excluding active peers.
-    @GuardedBy("lock") private final PriorityQueue<PeerAddress> inactives;
+    @GuardedBy("lock") private Queue<PeerAddress> inactives;
     @GuardedBy("lock") private final Map<PeerAddress, ExponentialBackoff> backoffMap;
 
     // Currently active peers. This is an ordered list rather than a set to make unit tests predictable.
@@ -118,6 +122,9 @@ public class PeerGroup implements TransactionBroadcaster {
     @GuardedBy("lock") private VersionMessage versionMessage;
     // Switch for enabling download of pending transaction dependencies.
     @GuardedBy("lock") private boolean downloadTxDependencies;
+    // A class that tracks recent transactions that have been broadcast across the network, counts how many
+    // peers announced them and updates the transaction confidence data. It is passed to each Peer.
+    private final MemoryPool memoryPool;
     // How many connections we want to have open at the current time. If we lose connections, we'll try opening more
     // until we reach this count.
     @GuardedBy("lock") private int maxConnections;
@@ -142,6 +149,10 @@ public class PeerGroup implements TransactionBroadcaster {
         public List<Message> getData(Peer peer, GetDataMessage m) {
             return handleGetData(m);
         }
+        // NIMBLECOINJ
+        public void onTransaction(Peer peer, Transaction t) {
+            broadcastTransactionToAllBut(t, peer);
+        };
 
         @Override
         public void onBlocksDownloaded(Peer peer, Block block, @Nullable FilteredBlock filteredBlock, int blocksLeft) {
@@ -154,6 +165,8 @@ public class PeerGroup implements TransactionBroadcaster {
                     log.debug("Force update Bloom filter due to high false positive rate ({} vs {})", rate, target);
                 recalculateFastCatchupAndFilter(FilterRecalculateMode.FORCE_SEND_FOR_REFRESH);
             }
+            // NIMBLECOINJ
+            broadcastBlock(block, peer);
         }
     };
 
@@ -245,6 +258,17 @@ public class PeerGroup implements TransactionBroadcaster {
     /** The default timeout between when a connection attempt begins and version message exchange completes */
     public static final int DEFAULT_CONNECT_TIMEOUT_MILLIS = 5000;
     private volatile int vConnectTimeoutMillis = DEFAULT_CONNECT_TIMEOUT_MILLIS;
+
+    // BEGIN NIMBLECOIN
+    //Whether to start a socket server accepting incoming connections
+    private boolean startServer = false;
+    //Port to start as a server if startServer==true
+    private int serverPort;
+    //Whether to accept udp messages
+    private boolean acceptUdp = false;
+    private volatile Timer highPriorityMessagesTimer;
+    // END NIMBLECOIN
+
     
     /** Whether bloom filter support is enabled when using a non FullPrunedBlockchain*/
     private volatile boolean vBloomFilteringEnabled = true;
@@ -324,7 +348,8 @@ public class PeerGroup implements TransactionBroadcaster {
      * Creates a new PeerGroup allowing you to specify the {@link ClientConnectionManager} which is used to create new
      * connections and keep track of existing ones.
      */
-    private PeerGroup(Context context, @Nullable AbstractBlockChain chain, ClientConnectionManager connectionManager, @Nullable TorClient torClient) {
+    private PeerGroup(Context context, @Nullable AbstractBlockChain chain,
+                      ClientConnectionManager connectionManager, @Nullable TorClient torClient, boolean startServer, int serverPort, boolean acceptUdp) {
         this.context = checkNotNull(context);
         this.params = context.getParams();
         this.chain = chain;
@@ -341,9 +366,17 @@ public class PeerGroup implements TransactionBroadcaster {
         maxConnections = 0;
 
         int height = chain == null ? 0 : chain.getBestChainHeight();
-        versionMessage = new VersionMessage(params, height);
+        // BEGIN NIMBLECOIN
         // We never request that the remote node wait for a bloom filter yet, as we have no wallets
+        this.versionMessage = new VersionMessage(params, height, true, chain.shouldVerifyTransactions(), serverPort, acceptUdp);
+        this.versionMessage.myAddr.setPort(serverPort);
+        // We never request that the remote node wait for a bloom filter yet, as we have no wallets
+        memoryPool = new MemoryPool();
+        // END NIMBLECOIN
+
         versionMessage.relayTxesBeforeFilter = true;
+
+
 
         downloadTxDependencies = true;
 
@@ -367,6 +400,9 @@ public class PeerGroup implements TransactionBroadcaster {
         peerEventListeners = new CopyOnWriteArrayList<ListenerRegistration<PeerEventListener>>();
         runningBroadcasts = Collections.synchronizedSet(new HashSet<TransactionBroadcast>());
         bloomFilterMerger = new FilterMerger(DEFAULT_BLOOM_FILTER_FP_RATE);
+        this.startServer = startServer;
+        this.serverPort = serverPort;
+        this.acceptUdp = acceptUdp;
     }
 
     private CountDownLatch executorStartupLatch = new CountDownLatch(1);
@@ -593,10 +629,17 @@ public class PeerGroup implements TransactionBroadcaster {
     public void setUserAgent(String name, String version, @Nullable String comments) {
         //TODO Check that height is needed here (it wasnt, but it should be, no?)
         int height = chain == null ? 0 : chain.getBestChainHeight();
-        VersionMessage ver = new VersionMessage(params, height);
+        // BEGIN NIMBLECOIN
+        boolean shouldVerifyTransactions = chain == null ? false : chain.shouldVerifyTransactions();        
+        VersionMessage ver = new VersionMessage(params, height, false, shouldVerifyTransactions, serverPort, acceptUdp);
+        // END NIMBLECOIN
+
         ver.relayTxesBeforeFilter = false;
         updateVersionMessageRelayTxesBeforeFilter(ver);
         ver.appendToSubVer(name, version, comments);
+        // BEGIN NIMBLECOIN
+        ver.myAddr.setPort(serverPort);
+        // END NIMBLECOIN
         setVersionMessage(ver);
     }
     
@@ -822,6 +865,26 @@ public class PeerGroup implements TransactionBroadcaster {
         }
         return false;
     }
+    // NIMBLECOIN: Ver si hay que pasar alguna variable local
+    void doStartupServer() {
+       if (startServer) {
+            channels.acceptConnections(new StreamParserFactory(){
+                @Override
+                public StreamParser getNewParser(InetAddress inetAddress, int port) {
+                    VersionMessage ver = getVersionMessage().duplicate();
+                    ver.bestHeight = chain == null ? 0 : chain.getBestChainHeight();
+                    ver.time = Utils.currentTimeSeconds();
+
+                    Peer peer = new Peer(PeerGroup.this, params, ver, new PeerAddress(inetAddress, port), chain, memoryPool, downloadTxDependencies, true);
+                    peer.addEventListener(startupListener, Threading.SAME_THREAD);
+                    peer.setMinProtocolVersion(vMinRequiredProtocolVersion);
+                    pendingPeers.add(peer);
+                    peer.setSocketTimeout(vConnectTimeoutMillis);
+                    return peer;
+                }
+            });            
+        }
+    }
 
     /**
      * Starts the PeerGroup and begins network activity.
@@ -853,8 +916,11 @@ public class PeerGroup implements TransactionBroadcaster {
                         }
                         log.info("Tor ready");
                     }
+                    highPriorityMessagesTimer = new Timer("High priority messages timer", true);
+ 
                     channels.startAsync();
                     channels.awaitRunning();
+                    doStartupServer();
                     triggerConnections();
                     setupPinging();
                 } catch (Throwable e) {
@@ -883,6 +949,9 @@ public class PeerGroup implements TransactionBroadcaster {
             public void run() {
                 try {
                     log.info("Stopping ...");
+                    // NIMBLECOINJ
+                    highPriorityMessagesTimer.cancel();
+
                     // Blocking close of all sockets.
                     channels.stopAsync();
                     channels.awaitTerminated();
@@ -1181,10 +1250,11 @@ public class PeerGroup implements TransactionBroadcaster {
     protected Peer connectTo(PeerAddress address, boolean incrementMaxConnections, int connectTimeoutMillis) {
         checkState(lock.isHeldByCurrentThread());
         VersionMessage ver = getVersionMessage().duplicate();
+        ver.theirAddr = address;
         ver.bestHeight = chain == null ? 0 : chain.getBestChainHeight();
         ver.time = Utils.currentTimeSeconds();
 
-        Peer peer = new Peer(params, ver, address, chain, downloadTxDependencies);
+        Peer peer = new Peer(this, params, ver, address, chain, memoryPool, downloadTxDependencies);
         peer.addEventListener(startupListener, Threading.SAME_THREAD);
         peer.setMinProtocolVersion(vMinRequiredProtocolVersion);
         pendingPeers.add(peer);
@@ -1267,9 +1337,29 @@ public class PeerGroup implements TransactionBroadcaster {
         int newSize = -1;
         lock.lock();
         try {
-            groupBackoff.trackSuccess();
-            backoffMap.get(peer.getAddress()).trackSuccess();
-
+             // BEGIN NIMBLECOIN MODIFIED
+            if (!peer.getInitiatedByPeer()) {
+                groupBackoff.trackSuccess();
+                backoffMap.get(peer.getAddress()).trackSuccess();                
+            }   
+            if (peer.getPeerVersionMessage().nonce == this.versionMessage.nonce) {
+                // Connected to self, disconnect.
+                log.error("Connected to myself, disconnecting...");
+                peer.close();
+                return;
+            }
+            for (Peer activePeer : peers) {
+                if (peer.getPeerVersionMessage().myAddr.equals(activePeer.getVersionMessage().theirAddr) ||
+                    peer.getPeerVersionMessage().myAddr.equals(activePeer.getPeerVersionMessage().myAddr)) {
+                    log.warn("Double connection with peer, disconecting... {} {} {} {}", 
+                            peer.getVersionMessage(), peer.getPeerVersionMessage(),
+                            activePeer.getVersionMessage(), activePeer.getPeerVersionMessage());
+                    peer.close();
+                    return;                    
+                }
+                
+            }
+            // END NIMBLECOIN
             // Sets up the newly connected peer so it can do everything it needs to.
             pendingPeers.remove(peer);
             peers.add(peer);
@@ -1415,7 +1505,11 @@ public class PeerGroup implements TransactionBroadcaster {
         int numConnectedPeers = 0;
         lock.lock();
         try {
-            pendingPeers.remove(peer);
+            // NIMBLECOIN MODIFIED
+            if (!peer.getInitiatedByPeer()) {
+                pendingPeers.remove(peer);
+            }
+            // NIMBLECOIN END
             peers.remove(peer);
 
             PeerAddress address = peer.getAddress();
@@ -1435,7 +1529,8 @@ public class PeerGroup implements TransactionBroadcaster {
             }
             numPeers = peers.size() + pendingPeers.size();
             numConnectedPeers = peers.size();
-
+            // IF ADDED NIMBLECOIN
+            if (!peer.getInitiatedByPeer()) {
             groupBackoff.trackFailure();
 
             if (exception instanceof NoRouteToHostException) {
@@ -1448,7 +1543,7 @@ public class PeerGroup implements TransactionBroadcaster {
                 // Put back on inactive list
                 inactives.offer(address);
             }
-
+            }
             if (numPeers < getMaxConnections()) {
                 triggerConnections();
             }
@@ -1838,7 +1933,109 @@ public class PeerGroup implements TransactionBroadcaster {
         broadcast.broadcast();
         return broadcast;
     }
+   // NIMBLECOIN BEGIN
+   /**
+     * Broadcast a message to all peers but peerToSkip 
+     */
+    public void broadcastLowPriorityMessage(Message message, Peer peerToSkip) {
+        broadcastMessage(message, false, true, true, peerToSkip, null);
+    }
 
+    /**
+     * Broadcast a udp message to all peers but peerToSkip 
+     */
+    public void broadcastHighPriorityMessage(Message message, Peer peerToSkip) {
+        broadcastMessage(message, true, true, false, peerToSkip, null);
+    }
+
+    private void broadcastMessage(Message message, 
+                                 boolean highPriority, 
+                                 boolean includePeersSupportingHighPriorityMessages,
+                                 boolean includePeersNotSupportingHighPriorityMessages,
+                                 Peer peerToSkip, 
+                                 Sha256Hash skipPeersWhichAlreadyReceivedThisHeader) {
+        for (Peer peer : peers) {
+            try {
+                if (peerToSkip!=null && peer.equals(peerToSkip)) continue;
+                if (skipPeersWhichAlreadyReceivedThisHeader!=null && peer.knowsAboutHeader(skipPeersWhichAlreadyReceivedThisHeader)) continue;
+                if (!includePeersSupportingHighPriorityMessages && peer.getPeerVersionMessage().acceptUdp()) continue;
+                if (!includePeersNotSupportingHighPriorityMessages && !peer.getPeerVersionMessage().acceptUdp()) continue;
+                if (highPriority) {
+                    peer.sendHighPriorityMessage(message);                        
+                } else {
+                    peer.sendLowPriorityMessage(message);                        
+                }
+            } catch (Exception e) {
+                log.error("Caught exception sending {} to {}", message, peer, e);
+            }
+        }        
+    }
+    
+    
+    /**
+     * Broadcast a block I just mined using pushheader and pushtxlist
+     */
+    public void broadcastMinedBlock(Block block) {
+        final PushHeader pushHeader = new PushHeader(params, block.cloneAsHeader());
+        broadcastPushHeader(pushHeader, null);
+        //Broadcast PushTransactionList
+        PushTransactionList pushTransactionList = new PushTransactionList(params, block);
+        broadcastLowPriorityMessage(pushTransactionList, null);
+    }
+
+    public void broadcastPushHeader(final PushHeader pushHeader, final Peer peerToSkip) {
+        //Broadcast header by udp
+        broadcastMessage(pushHeader, true, true, false, peerToSkip, null);
+        final long interval = 200;
+        final TimerTask task = new TimerTask() {
+            @Override
+            public void run() {
+                //Broadcast header by tcp to all peers which haven't received it 
+                broadcastMessage(pushHeader, false, true, false, peerToSkip, pushHeader.getHash());
+            }
+        };
+        highPriorityMessagesTimer.schedule(task, interval);        
+        //Broadcast header by tcp to peers not supportind udp
+        broadcastMessage(pushHeader, false, false, true, peerToSkip, null);        
+    }
+
+    
+    /**
+     * Sends an inv to all the peers announcing the block
+     */
+    public void broadcastBlock(Block block) {
+        broadcastBlock(block, null);
+    }
+
+    /**
+     * Sends an inv to all the peers (but peerToSkip) announcing the block
+     */
+    public void broadcastBlock(Block block, Peer peerToSkip) {
+        InventoryMessage inv = new InventoryMessage(params);
+        inv.addBlock(block);
+        broadcastLowPriorityMessage(inv, peerToSkip);
+    }
+
+    /**
+     * Broadcast the tx to all the peers
+     * @param tx
+     */
+    public void broadcastTransactionToAll(Transaction tx) {
+        broadcastTransactionToAllBut(tx, null);
+    }
+    
+    /**
+     * Broadcast the tx to all the peers but peerToSkip
+     * @param tx
+     * @param peerToSkip if peerToSkip!=null skips that peer
+     */
+    public void broadcastTransactionToAllBut(Transaction tx, Peer peerToSkip) {
+        InventoryMessage inv = new InventoryMessage(params);
+        inv.addTransaction(tx);
+        broadcastLowPriorityMessage(inv, peerToSkip);
+    }
+    
+    // NIMBLECOIN END
     /**
      * Returns the period between pings for an individual peer. Setting this lower means more accurate and timely ping
      * times are available via {@link org.bitcoinj.core.Peer#getLastPingTime()} but it increases load on the
@@ -1967,6 +2164,15 @@ public class PeerGroup implements TransactionBroadcaster {
             lock.unlock();
         }
     }
+    // NIMBLECOIN BEGIN
+    public boolean shouldProcessReceivedMessage(MessageIdentifier messageIdentifier) {
+        receivedMessages.putIfAbsent(messageIdentifier, new AtomicInteger(0));
+        int numberOfTimesTheMessageWasReceived = receivedMessages.get(messageIdentifier).incrementAndGet();
+        // if numberOfTimesTheMessageWasReceived is power of 2, process message
+        boolean isPowerOf2 = Utils.isPowerOf2(numberOfTimesTheMessageWasReceived);        
+        return isPowerOf2 && numberOfTimesTheMessageWasReceived!=2 && numberOfTimesTheMessageWasReceived!=4;
+    }
+    // NIMBLECOIN END
 
     /**
      * Returns the {@link com.subgraph.orchid.TorClient} object for this peer group, if Tor is in use, null otherwise.

@@ -190,12 +190,17 @@ public class ProtobufParser<MessageType extends MessageLite> extends AbstractTim
 
             // If there are still bytes remaining, see if we can pull out another message since we won't get called again
             if (buff.hasRemaining())
-                return len + 4 + receiveBytes(buff);
+                return len + 4 + receiveLowPriorityBytes(buff);
             else
                 return len + 4;
         } finally {
             lock.unlock();
         }
+    }
+    // NIMBLECOIN
+    @Override
+    public void receiveHighPriorityBytes(byte[] bytes, int offset, int length) {
+        throw new UnsupportedOperationException(); 
     }
 
     @Override

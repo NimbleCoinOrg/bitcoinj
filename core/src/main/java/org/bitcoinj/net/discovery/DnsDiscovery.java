@@ -1,6 +1,5 @@
 /**
  * Copyright 2011 John Sample
- * Copyright 2014 Andreas Schildbach
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +14,15 @@
  * limitations under the License.
  */
 
-package org.bitcoinj.net.discovery;
+package com.google.bitcoin.net.discovery;
 
-import org.bitcoinj.core.*;
-import org.bitcoinj.utils.*;
+import com.google.bitcoin.core.NetworkParameters;
+import com.google.common.collect.Lists;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.net.*;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -35,7 +37,12 @@ import java.util.concurrent.*;
  * will return up to 30 random peers from the set of those returned within the timeout period. If you want more peers
  * to connect to, you need to discover them via other means (like addr broadcasts).</p>
  */
-public class DnsDiscovery extends MultiplexingDiscovery {
+public class DnsDiscovery implements PeerDiscovery {
+    private static final Logger log = LoggerFactory.getLogger(DnsDiscovery.class);
+
+    private final String[] hostNames;
+    private final NetworkParameters netParams;
+
     /**
      * Supports finding peers through DNS A records. Community run DNS entry points will be used.
      *
@@ -48,60 +55,61 @@ public class DnsDiscovery extends MultiplexingDiscovery {
     /**
      * Supports finding peers through DNS A records.
      *
-     * @param dnsSeeds Host names to be examined for seed addresses.
-     * @param params Network parameters to be used for port information.
+     * @param hostNames Host names to be examined for seed addresses.
+     * @param netParams Network parameters to be used for port information.
      */
-    public DnsDiscovery(String[] dnsSeeds, NetworkParameters params) {
-        super(params, buildDiscoveries(params, dnsSeeds));
+    public DnsDiscovery(String[] hostNames, NetworkParameters netParams) {
+        this.hostNames = hostNames;
+        this.netParams = netParams;
     }
 
-    private static List<PeerDiscovery> buildDiscoveries(NetworkParameters params, String[] seeds) {
-        List<PeerDiscovery> discoveries = new ArrayList<PeerDiscovery>(seeds.length);
-        for (String seed : seeds)
-            discoveries.add(new DnsSeedDiscovery(params, seed));
-        return discoveries;
-    }
+    public InetSocketAddress[] getPeers(long timeoutValue, TimeUnit timeoutUnit) throws PeerDiscoveryException {
+        if (hostNames == null)
+            throw new PeerDiscoveryException("Unable to find any peers via DNS");
 
-    @Override
-    protected ExecutorService createExecutor() {
-        // Attempted workaround for reported bugs on Linux in which gethostbyname does not appear to be properly
-        // thread safe and can cause segfaults on some libc versions.
-        if (System.getProperty("os.name").toLowerCase().contains("linux"))
-            return Executors.newSingleThreadExecutor(new ContextPropagatingThreadFactory("DNS seed lookups"));
-        else
-            return Executors.newFixedThreadPool(seeds.size(), new DaemonThreadFactory("DNS seed lookups"));
-    }
-
-    /** Implements discovery from a single DNS host. */
-    public static class DnsSeedDiscovery implements PeerDiscovery {
-        private final String hostname;
-        private final NetworkParameters params;
-
-        public DnsSeedDiscovery(NetworkParameters params, String hostname) {
-            this.hostname = hostname;
-            this.params = params;
-        }
-
-        @Override
-        public InetSocketAddress[] getPeers(long timeoutValue, TimeUnit timeoutUnit) throws PeerDiscoveryException {
-            try {
-                InetAddress[] response = InetAddress.getAllByName(hostname);
-                InetSocketAddress[] result = new InetSocketAddress[response.length];
-                for (int i = 0; i < response.length; i++)
-                    result[i] = new InetSocketAddress(response[i], params.getPort());
-                return result;
-            } catch (UnknownHostException e) {
-                throw new PeerDiscoveryException(e);
+        // Java doesn't have an async DNS API so we have to do all lookups in a thread pool, as sometimes seeds go
+        // hard down and it takes ages to give up and move on.
+        ExecutorService threadPool = Executors.newFixedThreadPool(hostNames.length);
+        try {
+            List<Callable<InetAddress[]>> tasks = Lists.newArrayList();
+            for (final String seed : hostNames)
+                tasks.add(new Callable<InetAddress[]>() {
+                    public InetAddress[] call() throws Exception {
+                        return InetAddress.getAllByName(seed);
+                    }
+                });
+            final List<Future<InetAddress[]>> futures = threadPool.invokeAll(tasks, timeoutValue, timeoutUnit);
+            ArrayList<InetSocketAddress> addrs = Lists.newArrayList();
+            for (int i = 0; i < futures.size(); i++) {
+                Future<InetAddress[]> future = futures.get(i);
+                if (future.isCancelled()) {
+                    log.warn("{} timed out", hostNames[i]);
+                    continue;  // Timed out.
+                }
+                final InetAddress[] inetAddresses;
+                try {
+                    inetAddresses = future.get();
+                } catch (ExecutionException e) {
+                    log.error("Failed to look up DNS seeds from {}: {}", hostNames[i], e.getMessage());
+                    continue;
+                }
+                for (InetAddress addr : inetAddresses) {
+                    addrs.add(new InetSocketAddress(addr, netParams.getPort()));
+                }
             }
+            if (addrs.size() == 0)
+                throw new PeerDiscoveryException("Unable to find any peers via DNS");
+            Collections.shuffle(addrs);
+            threadPool.shutdownNow();
+            return addrs.toArray(new InetSocketAddress[addrs.size()]);
+        } catch (InterruptedException e) {
+            throw new PeerDiscoveryException(e);
+        } finally {
+            threadPool.shutdown();
         }
+    }
 
-        @Override
-        public void shutdown() {
-        }
-
-        @Override
-        public String toString() {
-            return hostname;
-        }
+    /** We don't have a way to abort a DNS lookup, so this does nothing */
+    public void shutdown() {
     }
 }

@@ -23,7 +23,15 @@ import java.io.IOException;
  */
 public interface MessageWriteTarget {
     /**
-     * Writes the given bytes to the remote server.
+     * Sets the UDP port of the receiver
+     */
+    void setUDPPort(int udpPort) throws IOException;
+    /**
+     * Writes the given bytes to the remote server via the UDP socket.
+     */
+    void writeHighPriorityBytes(byte[] message) throws IOException;
+    /**
+     * Writes the given bytes to the remote server via the TCP socket.
      */
     void writeBytes(byte[] message) throws IOException;
     /**
